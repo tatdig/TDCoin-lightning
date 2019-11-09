@@ -1,3 +1,4 @@
+Starting the daemon lightningd --network=tdcoin bitcoin-cli=/opt/tdcoin/tdcoin-cli --daemon
 # c-lightning: A specification compliant Lightning Network implementation in C
 
 c-lightning is a lighweight, highly customizable and [standard compliant][std] implementation of the Lightning Network protocol.
