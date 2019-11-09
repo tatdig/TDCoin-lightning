@@ -25,13 +25,48 @@ static u8 liquid_regtest_fee_asset[] = {
 };
 
 const struct chainparams networks[] = {
+    {.network_name = "tdcoin",
+     .bip173_name = "tc",
+     .bip70_name = "main",
+     // 00000000<------>18 bf 6f b2 9c 96 49<-->e8 a3 14 97 57 6e 1a<-->c9 5a fd 32 c3 d0 51 <->ca 2d 3b 0d 78 9c a1
+     // 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f BTC
+     .genesis_blockhash = {{{.u.u8 = {	0xa1, 0x9c, 0x78, 0x0d, 0x3b, 0x2d, 0xca,
+					0x51, 0xd0, 0xc3, 0x32, 0xfd, 0x5a, 0xc9,
+					0x1a, 0x6e, 0x57, 0x97, 0x14, 0xa3, 0xe8,
+					0x49, 0x96, 0x9c, 0xb2, 0x6f, 0xbf, 0x18,
+					0x00, 0x00, 0x00, 0x00}}}},
+     .rpc_port = 9902,
+     .cli = "tdcoin-cli",
+     .cli_args = NULL,
+     .cli_min_supported_version = 150000,
+     .dust_limit = { 546 },
+     /* BOLT #2:
+      *
+      * The sending node:
+      *...
+      *   - MUST set `funding_satoshis` to less than 2^24 satoshi.
+      */
+     .max_funding = AMOUNT_SAT_INIT((1 << 24) - 1),
+     .max_payment = AMOUNT_MSAT_INIT(0xFFFFFFFFULL),
+     /* "Lightning Charge Powers Developers & Blockstream Store" */
+     .when_lightning_became_cool = 504500,
+     .p2pkh_version = 0,
+     .p2sh_version = 5,
+     .testnet = false,
+     .fee_asset_tag = NULL,
+     .bip32_key_version = {	.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC,
+				.bip32_privkey_version = BIP32_VER_MAIN_PRIVATE},
+     .is_elements = false},
+
     {.network_name = "bitcoin",
      .bip173_name = "bc",
      .bip70_name = "main",
-     .genesis_blockhash = {{{.u.u8 = {0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3,
-				      0x72, 0xc1, 0xa6, 0xa2, 0x46, 0xae, 0x63,
-				      0xf7, 0x4f, 0x93, 0x1e, 0x83, 0x65, 0xe1,
-				      0x5a, 0x08, 0x9c, 0x68, 0xd6, 0x19, 0x00,
+     // 0000000018 bf 6f b2 9c 96 49	e8 a3 14 97 57 6e 1a	c9 5a fd 32 c3 d0 51 	ca 2d 3b 0d 78 9c a1
+     // 000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f BTC
+     .genesis_blockhash = {{{.u.u8 = {0xa1, 0x9c, 0x78, 0x0d, 0x3b, 0x2d, 0xca,
+				      0x51, 0xd0, 0xc3, 0x32, 0xfd, 0x5a, 0xc9,
+				      0x1a, 0x6e, 0x57, 0x97, 0x14, 0xa3, 0xe8,
+				      0x49, 0x96, 0x9c, 0xb2, 0x6f, 0xbf, 0x18,
 				      0x00, 0x00, 0x00, 0x00}}}},
      .rpc_port = 8332,
      .cli = "bitcoin-cli",
@@ -55,6 +90,7 @@ const struct chainparams networks[] = {
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC,
 			   .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE},
      .is_elements = false},
+
     {.network_name = "regtest",
      .bip173_name = "bcrt",
      .bip70_name = "regtest",
@@ -118,6 +154,8 @@ const struct chainparams networks[] = {
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC,
 			   .bip32_privkey_version = BIP32_VER_TEST_PRIVATE},
      .is_elements = false},
+
+
     {.network_name = "litecoin",
      .bip173_name = "ltc",
      .bip70_name = "main",
@@ -141,6 +179,8 @@ const struct chainparams networks[] = {
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_MAIN_PUBLIC,
 			   .bip32_privkey_version = BIP32_VER_MAIN_PRIVATE},
      .is_elements = false},
+
+
     {.network_name = "litecoin-testnet",
      .bip173_name = "tltc",
      .bip70_name = "test",
@@ -164,6 +204,8 @@ const struct chainparams networks[] = {
      .bip32_key_version = {.bip32_pubkey_version = BIP32_VER_TEST_PUBLIC,
 			   .bip32_privkey_version = BIP32_VER_TEST_PRIVATE},
      .is_elements = false},
+
+
     {.network_name = "liquid-regtest",
      .bip173_name = "ert",
      .bip70_name = "liquid-regtest",
