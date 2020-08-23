@@ -1,6 +1,7 @@
 #include "routing.h"
 #include <arpa/inet.h>
 #include <bitcoin/block.h>
+#include <bitcoin/chainparams.h>
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/endian/endian.h>
@@ -93,6 +94,8 @@ HTABLE_DEFINE_TYPE(struct pending_node_announce, pending_node_announce_keyof,
 struct unupdated_channel {
 	/* The channel_announcement message */
 	const u8 *channel_announce;
+	/* The feature bitmap within it */
+	const u8 *features;
 	/* The short_channel_id */
 	struct short_channel_id scid;
 	/* The ids of the nodes */
@@ -283,7 +286,6 @@ static bool in_txout_failures(struct routing_state *rstate,
 }
 
 struct routing_state *new_routing_state(const tal_t *ctx,
-					const struct chainparams *chainparams,
 					const struct node_id *local_id,
 					struct list_head *peers,
 					struct timers *timers,
@@ -295,7 +297,6 @@ struct routing_state *new_routing_state(const tal_t *ctx,
 	rstate->nodes = new_node_map(rstate);
 	rstate->gs = gossip_store_new(rstate, peers);
 	rstate->timers = timers;
-	rstate->chainparams = chainparams;
 	rstate->local_id = *local_id;
 	rstate->local_channel_announced = false;
 	rstate->last_timestamp = 0;
@@ -380,6 +381,8 @@ static struct node *new_node(struct routing_state *rstate,
 	n->id = *id;
 	memset(n->chans.arr, 0, sizeof(n->chans.arr));
 	broadcastable_init(&n->bcast);
+	/* We don't know, so assume legacy. */
+	n->hop_style = ROUTE_HOP_LEGACY;
 	n->tokens = TOKEN_MAX;
 	node_map_add(rstate->nodes, n);
 	tal_add_destructor2(n, destroy_node, rstate);
@@ -531,10 +534,10 @@ static void bad_gossip_order(const u8 *msg,
 			     const struct peer *peer,
 			     const char *details)
 {
-	status_debug("Bad gossip order from %s: %s before announcement %s",
-		     peer ? type_to_string(tmpctx, struct node_id, &peer->id)
-		     : "unknown", wire_type_name(fromwire_peektype(msg)),
-		     details);
+	status_peer_debug(peer ? &peer->id : NULL,
+			  "Bad gossip order: %s before announcement %s",
+			  wire_type_name(fromwire_peektype(msg)),
+			  details);
 }
 
 static void destroy_local_chan(struct local_chan *local_chan,
@@ -571,7 +574,8 @@ struct chan *new_chan(struct routing_state *rstate,
 		      const struct short_channel_id *scid,
 		      const struct node_id *id1,
 		      const struct node_id *id2,
-		      struct amount_sat satoshis)
+		      struct amount_sat satoshis,
+		      const u8 *features)
 {
 	struct chan *chan = tal(rstate, struct chan);
 	int n1idx = node_id_idx(id1, id2);
@@ -606,6 +610,8 @@ struct chan *new_chan(struct routing_state *rstate,
 	init_half_chan(rstate, chan, n1idx);
 	init_half_chan(rstate, chan, !n1idx);
 
+	/* Stash hint here about whether we have features */
+	chan->half[0].any_features = tal_bytelen(features) != 0;
 	uintmap_add(&rstate->chanmap, scid->u64, chan);
 
 	/* Initialize shadow structure if it's local */
@@ -644,14 +650,13 @@ static WARN_UNUSED_RESULT bool risk_add_fee(struct amount_msat *risk,
 					    u32 delay, double riskfactor,
 					    u64 riskbias)
 {
-	double r;
+	struct amount_msat riskfee;
 
-	/* Won't overflow on add, just lose precision */
-	r = (double)riskbias + riskfactor * delay * msat.millisatoshis + risk->millisatoshis; /* Raw: to double */
-	if (r > UINT64_MAX)
+	if (!amount_msat_scale(&riskfee, msat, riskfactor * delay))
 		return false;
-	risk->millisatoshis = r; /* Raw: from double */
-	return true;
+	if (!amount_msat_add(&riskfee, riskfee, amount_msat(riskbias)))
+		return false;
+	return amount_msat_add(risk, *risk, riskfee);
 }
 
 /* Check that we can fit through this channel's indicated
@@ -682,7 +687,7 @@ static bool fuzz_fee(u64 *fee,
 	 * 2*fuzz*rand              random number between 0.0 -> 2*fuzz
 	 * 2*fuzz*rand - fuzz       random number between -fuzz -> +fuzz
 	 */
-	fee_scale = 1.0 + (2.0 * fuzz * h / UINT64_MAX) - fuzz;
+	fee_scale = 1.0 + (2.0 * fuzz * h / (double)UINT64_MAX) - fuzz;
 	fuzzed_fee = *fee * fee_scale;
 	if (fee_scale > 1.0 && fuzzed_fee < *fee)
 		return false;
@@ -1203,7 +1208,7 @@ find_shorter_route(const tal_t *ctx, struct routing_state *rstate,
 	 * per block delay, which is close enough to zero to not break
 	 * this algorithm, but still provide some bias towards
 	 * low-delay routes. */
-	riskfactor = (double)1.0 / msat.millisatoshis; /* Raw: inversion */
+	riskfactor = amount_msat_ratio(AMOUNT_MSAT(1), msat);
 
 	/* First, figure out if a short route is even possible.
 	 * We set the cost function to ignore total, riskbias 1 and riskfactor
@@ -1217,10 +1222,19 @@ find_shorter_route(const tal_t *ctx, struct routing_state *rstate,
 		 unvisited, shortest_cost_function);
 	dijkstra_cleanup(unvisited);
 
-	/* This must succeed, since we found a route before */
+	/* This will usually succeed, since we found a route before; however
+	 * it's possible that it fails in corner cases.  Consider that the reduced
+	 * riskfactor may make us select a more fee-expensive route, which then
+	 * makes us unable to complete the route due to htlc_max restrictions. */
 	short_route = build_route(ctx, rstate, dst, src, me, riskfactor, 1,
 				  fuzz, base_seed, fee);
-	assert(short_route);
+	if (!short_route) {
+		status_info("Could't find short enough route %s->%s",
+			    type_to_string(tmpctx, struct node_id, &dst->id),
+			    type_to_string(tmpctx, struct node_id, &src->id));
+		goto out;
+	}
+
 	if (!amount_msat_sub(&short_cost,
 			     dst->dijkstra.total, src->dijkstra.total))
 		goto bad_total;
@@ -1407,7 +1421,7 @@ static u8 *check_channel_announcement(const tal_t *ctx,
 	if (!check_signed_hash_nodeid(&hash, node1_sig, node1_id)) {
 		return towire_errorfmt(ctx, NULL,
 				       "Bad node_signature_1 %s hash %s"
-				       " on node_announcement %s",
+				       " on channel_announcement %s",
 				       type_to_string(ctx,
 						      secp256k1_ecdsa_signature,
 						      node1_sig),
@@ -1419,7 +1433,7 @@ static u8 *check_channel_announcement(const tal_t *ctx,
 	if (!check_signed_hash_nodeid(&hash, node2_sig, node2_id)) {
 		return towire_errorfmt(ctx, NULL,
 				       "Bad node_signature_2 %s hash %s"
-				       " on node_announcement %s",
+				       " on channel_announcement %s",
 				       type_to_string(ctx,
 						      secp256k1_ecdsa_signature,
 						      node2_sig),
@@ -1431,7 +1445,7 @@ static u8 *check_channel_announcement(const tal_t *ctx,
 	if (!check_signed_hash(&hash, bitcoin1_sig, bitcoin1_key)) {
 		return towire_errorfmt(ctx, NULL,
 				       "Bad bitcoin_signature_1 %s hash %s"
-				       " on node_announcement %s",
+				       " on channel_announcement %s",
 				       type_to_string(ctx,
 						      secp256k1_ecdsa_signature,
 						      bitcoin1_sig),
@@ -1443,7 +1457,7 @@ static u8 *check_channel_announcement(const tal_t *ctx,
 	if (!check_signed_hash(&hash, bitcoin2_sig, bitcoin2_key)) {
 		return towire_errorfmt(ctx, NULL,
 				       "Bad bitcoin_signature_2 %s hash %s"
-				       " on node_announcement %s",
+				       " on channel_announcement %s",
 				       type_to_string(ctx,
 						      secp256k1_ecdsa_signature,
 						      bitcoin2_sig),
@@ -1641,7 +1655,8 @@ bool routing_add_channel_announcement(struct routing_state *rstate,
 	}
 
 	uc = tal(rstate, struct unupdated_channel);
-	uc->channel_announce = tal_dup_arr(uc, u8, msg, tal_count(msg), 0);
+	uc->channel_announce = tal_dup_talarr(uc, u8, msg);
+	uc->features = tal_steal(uc, features);
 	uc->added = gossip_time_now(rstate);
 	uc->index = index;
 	uc->sat = sat;
@@ -1685,8 +1700,7 @@ u8 *handle_channel_announcement(struct routing_state *rstate,
 	pending->updates[0] = NULL;
 	pending->updates[1] = NULL;
 	pending->update_peer_softref[0] = pending->update_peer_softref[1] = NULL;
-	pending->announce = tal_dup_arr(pending, u8,
-					announce, tal_count(announce), 0);
+	pending->announce = tal_dup_talarr(pending, u8, announce);
 	pending->update_timestamps[0] = pending->update_timestamps[1] = 0;
 
 	if (!fromwire_channel_announcement(pending, pending->announce,
@@ -1712,11 +1726,12 @@ u8 *handle_channel_announcement(struct routing_state *rstate,
 	 * anyway. */
 	if (current_blockheight != 0
 	    && short_channel_id_blocknum(&pending->short_channel_id) > current_blockheight) {
-		status_debug("Ignoring future channel_announcment for %s"
-			     " (current block %u)",
-			     type_to_string(tmpctx, struct short_channel_id,
-					    &pending->short_channel_id),
-			     current_blockheight);
+		status_peer_debug(peer ? &peer->id : NULL,
+				  "Ignoring future channel_announcment for %s"
+				  " (current block %u)",
+				  type_to_string(tmpctx, struct short_channel_id,
+						 &pending->short_channel_id),
+				  current_blockheight);
 		goto ignored;
 	}
 
@@ -1762,30 +1777,13 @@ u8 *handle_channel_announcement(struct routing_state *rstate,
 	/* FIXME: Handle duplicates as per BOLT #7 */
 
 	/* BOLT #7:
-	 *
-	 *  - if `features` field contains _unknown even bits_:
-	 *    - MUST NOT parse the remainder of the message.
-	 *    - MAY discard the message altogether.
-	 *    - SHOULD NOT connect to the node.
-	 *  - MAY forward `node_announcement`s that contain an _unknown_
-	 *   `features` _bit_, regardless of if it has parsed the announcement
-	 *   or not.
-	 */
-	if (!features_supported(features)) {
-		status_debug("Ignoring channel announcement, unsupported features %s.",
-			     tal_hex(pending, features));
-		goto ignored;
-	}
-
-	/* BOLT #7:
 	 * The receiving node:
 	 *...
 	 *  - if the specified `chain_hash` is unknown to the receiver:
 	 *    - MUST ignore the message.
 	 */
-	if (!bitcoin_blkid_eq(&chain_hash,
-			      &rstate->chainparams->genesis_blockhash)) {
-		status_debug(
+	if (!bitcoin_blkid_eq(&chain_hash, &chainparams->genesis_blockhash)) {
+		status_peer_debug(peer ? &peer->id : NULL,
 		    "Received channel_announcement %s for unknown chain %s",
 		    type_to_string(pending, struct short_channel_id,
 				   &pending->short_channel_id),
@@ -1822,16 +1820,18 @@ u8 *handle_channel_announcement(struct routing_state *rstate,
 	    > 100000) {
 		static bool warned = false;
 		if (!warned) {
-			status_unusual("Flooded by channel_announcements:"
-				       " ignoring some");
+			status_peer_unusual(peer ? &peer->id : NULL,
+					    "Flooded by channel_announcements:"
+					    " ignoring some");
 			warned = true;
 		}
 		goto ignored;
 	}
 
-	status_debug("Received channel_announcement for channel %s",
-		     type_to_string(tmpctx, struct short_channel_id,
-				    &pending->short_channel_id));
+	status_peer_debug(peer ? &peer->id : NULL,
+			  "Received channel_announcement for channel %s",
+			  type_to_string(tmpctx, struct short_channel_id,
+					 &pending->short_channel_id));
 
 	/* Add both endpoints to the pending_node_map so we can stash
 	 * node_announcements while we wait for the txout check */
@@ -1872,12 +1872,11 @@ static void process_pending_channel_update(struct daemon *daemon,
 	err = handle_channel_update(rstate, cupdate, peer, NULL);
 	if (err) {
 		/* FIXME: We could send this error back to peer if != NULL */
-		status_debug("Pending channel_update for %s from %s: %s",
-			     type_to_string(tmpctx, struct short_channel_id, scid),
-			     peer
-			     ? type_to_string(tmpctx, struct node_id, &peer->id)
-			     : "unknown",
-			     sanitize_error(tmpctx, err, NULL));
+		status_peer_debug(peer ? &peer->id : NULL,
+				  "Pending channel_update for %s: %s",
+				  type_to_string(tmpctx, struct short_channel_id,
+						 scid),
+				  sanitize_error(tmpctx, err, NULL));
 		tal_free(err);
 	}
 }
@@ -1890,10 +1889,13 @@ bool handle_pending_cannouncement(struct daemon *daemon,
 {
 	const u8 *s;
 	struct pending_cannouncement *pending;
+	const struct node_id *src;
 
 	pending = find_pending_cannouncement(rstate, scid);
 	if (!pending)
 		return false;
+
+	src = pending->peer_softref ? &pending->peer_softref->id : NULL;
 
 	/* BOLT #7:
 	 *
@@ -1903,9 +1905,11 @@ bool handle_pending_cannouncement(struct daemon *daemon,
 	 *    - MUST ignore the message.
 	 */
 	if (tal_count(outscript) == 0) {
-		status_debug("channel_announcement: no unspent txout %s",
-			     type_to_string(pending, struct short_channel_id,
-					    scid));
+		status_peer_debug(src,
+				  "channel_announcement: no unspent txout %s",
+				  type_to_string(pending,
+						 struct short_channel_id,
+						 scid));
 		tal_free(pending);
 		add_to_txout_failures(rstate, scid);
 		return false;
@@ -1926,10 +1930,13 @@ bool handle_pending_cannouncement(struct daemon *daemon,
 						   &pending->bitcoin_key_2));
 
 	if (!scripteq(s, outscript)) {
-		status_debug("channel_announcement: txout %s expectes %s, got %s",
-			     type_to_string(pending, struct short_channel_id,
-					    scid),
-			     tal_hex(tmpctx, s), tal_hex(tmpctx, outscript));
+		status_peer_debug(src,
+				  "channel_announcement: txout %s expected %s, got %s",
+				  type_to_string(
+					  pending, struct short_channel_id,
+					  scid),
+				  tal_hex(tmpctx, s),
+				  tal_hex(tmpctx, outscript));
 		tal_free(pending);
 		return false;
 	}
@@ -1941,8 +1948,9 @@ bool handle_pending_cannouncement(struct daemon *daemon,
 	/* Can fail if channel_announcement too old */
 	if (!routing_add_channel_announcement(rstate, pending->announce, sat, 0,
 					      pending->peer_softref))
-		status_unusual("Could not add channel_announcement %s: too old?",
-			       tal_hex(tmpctx, pending->announce));
+		status_peer_unusual(src,
+				    "Could not add channel_announcement %s: too old?",
+				    tal_hex(tmpctx, pending->announce));
 	else {
 		/* Did we have an update waiting?  If so, apply now. */
 		process_pending_channel_update(daemon, rstate, scid, pending->updates[0],
@@ -1966,10 +1974,12 @@ static void update_pending(struct pending_cannouncement *pending,
 
 	if (pending->update_timestamps[direction] < timestamp) {
 		if (pending->updates[direction]) {
-			status_debug("Replacing existing update");
+			status_peer_debug(peer ? &peer->id : NULL,
+					  "Replacing existing update");
 			tal_free(pending->updates[direction]);
 		}
-		pending->updates[direction] = tal_dup_arr(pending, u8, update, tal_count(update), 0);
+		pending->updates[direction]
+			= tal_dup_talarr(pending, u8, update);
 		pending->update_timestamps[direction] = timestamp;
 		clear_softref(pending, &pending->update_peer_softref[direction]);
 		set_softref(pending, &pending->update_peer_softref[direction],
@@ -2070,21 +2080,23 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	} else {
 		/* If not indicated, set htlc_max_msat to channel capacity */
 		if (!amount_sat_to_msat(&htlc_maximum, sat)) {
-			status_broken("Channel capacity %s overflows!",
-				      type_to_string(tmpctx, struct amount_sat,
-						     &sat));
+			status_peer_broken(peer ? &peer->id : NULL,
+					   "Channel capacity %s overflows!",
+					   type_to_string(tmpctx, struct amount_sat,
+							  &sat));
 			return false;
 		}
 	}
 
 	/* Check timestamp is sane (unless from store). */
 	if (!index && !timestamp_reasonable(rstate, timestamp)) {
-		status_debug("Ignoring update timestamp %u for %s/%u",
-			     timestamp,
-			     type_to_string(tmpctx,
-					    struct short_channel_id,
-					    &short_channel_id),
-			     direction);
+		status_peer_debug(peer ? &peer->id : NULL,
+				  "Ignoring update timestamp %u for %s/%u",
+				  timestamp,
+				  type_to_string(tmpctx,
+						 struct short_channel_id,
+						 &short_channel_id),
+				  direction);
 		return false;
 	}
 
@@ -2092,7 +2104,7 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	if (uc) {
 		assert(!chan);
 		chan = new_chan(rstate, &short_channel_id,
-				&uc->id[0], &uc->id[1], sat);
+				&uc->id[0], &uc->id[1], sat, uc->features);
 	}
 
 	/* Discard older updates */
@@ -2115,12 +2127,14 @@ bool routing_add_channel_update(struct routing_state *rstate,
 		/* Allow redundant updates once every 7 days */
 		if (timestamp < hc->bcast.timestamp + GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip_prune) / 2
 		    && !cupdate_different(rstate->gs, hc, update)) {
-			status_debug("Ignoring redundant update for %s/%u"
-				     " (last %u, now %u)",
-				     type_to_string(tmpctx,
-						    struct short_channel_id,
-						    &short_channel_id),
-				     direction, hc->bcast.timestamp, timestamp);
+			status_peer_debug(peer ? &peer->id : NULL,
+					  "Ignoring redundant update for %s/%u"
+					  " (last %u, now %u)",
+					  type_to_string(tmpctx,
+							 struct short_channel_id,
+							 &short_channel_id),
+					  direction,
+					  hc->bcast.timestamp, timestamp);
 			/* Ignoring != failing */
 			return true;
 		}
@@ -2128,12 +2142,14 @@ bool routing_add_channel_update(struct routing_state *rstate,
 		/* Make sure it's not spamming us. */
 		if (!ratelimit(rstate,
 			       &hc->tokens, hc->bcast.timestamp, timestamp)) {
-			status_debug("Ignoring spammy update for %s/%u"
-				     " (last %u, now %u)",
-				     type_to_string(tmpctx,
-						    struct short_channel_id,
-						    &short_channel_id),
-				     direction, hc->bcast.timestamp, timestamp);
+			status_peer_debug(peer ? &peer->id : NULL,
+					  "Ignoring spammy update for %s/%u"
+					  " (last %u, now %u)",
+					  type_to_string(tmpctx,
+							 struct short_channel_id,
+							 &short_channel_id),
+					  direction,
+					  hc->bcast.timestamp, timestamp);
 			/* Ignoring != failing */
 			return true;
 		}
@@ -2142,8 +2158,8 @@ bool routing_add_channel_update(struct routing_state *rstate,
 	/* FIXME: https://github.com/lightningnetwork/lightning-rfc/pull/512
 	 * says we MUST NOT exceed 2^32-1, but c-lightning did, so just trim
 	 * rather than rejecting. */
-	if (amount_msat_greater(htlc_maximum, rstate->chainparams->max_payment))
-		htlc_maximum = rstate->chainparams->max_payment;
+	if (amount_msat_greater(htlc_maximum, chainparams->max_payment))
+		htlc_maximum = chainparams->max_payment;
 
 	set_connection_values(chan, direction, fee_base_msat,
 			      fee_proportional_millionths, expiry,
@@ -2297,11 +2313,11 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 	 *    active on the specified chain):
 	 *    - MUST ignore the channel update.
 	 */
-	if (!bitcoin_blkid_eq(&chain_hash,
-			      &rstate->chainparams->genesis_blockhash)) {
-		status_debug("Received channel_update for unknown chain %s",
-			     type_to_string(tmpctx, struct bitcoin_blkid,
-					    &chain_hash));
+	if (!bitcoin_blkid_eq(&chain_hash, &chainparams->genesis_blockhash)) {
+		status_peer_debug(peer ? &peer->id : NULL,
+				  "Received channel_update for unknown chain %s",
+				  type_to_string(tmpctx, struct bitcoin_blkid,
+						 &chain_hash));
 		return NULL;
 	}
 
@@ -2314,11 +2330,12 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 	/* If we have an unvalidated channel, just queue on that */
 	pending = find_pending_cannouncement(rstate, &short_channel_id);
 	if (pending) {
-		status_debug("Updated pending announce with update %s/%u",
-			     type_to_string(tmpctx,
-					    struct short_channel_id,
-					    &short_channel_id),
-			     direction);
+		status_peer_debug(peer ? &peer->id : NULL,
+				  "Updated pending announce with update %s/%u",
+				  type_to_string(tmpctx,
+						 struct short_channel_id,
+						 &short_channel_id),
+				  direction);
 		update_pending(pending, timestamp, serialized, direction, peer);
 		return NULL;
 	}
@@ -2351,13 +2368,12 @@ u8 *handle_channel_update(struct routing_state *rstate, const u8 *update TAKES,
 		return err;
 	}
 
-	status_debug("Received channel_update for channel %s/%d now %s (from %s)",
-		     type_to_string(tmpctx, struct short_channel_id,
-				    &short_channel_id),
-		     channel_flags & 0x01,
-		     channel_flags & ROUTING_FLAGS_DISABLED ? "DISABLED" : "ACTIVE",
-		     peer ? type_to_string(tmpctx, struct node_id, &peer->id)
-		     : "unknown");
+	status_peer_debug(peer ? &peer->id : NULL,
+			  "Received channel_update for channel %s/%d now %s",
+			  type_to_string(tmpctx, struct short_channel_id,
+					 &short_channel_id),
+			  channel_flags & 0x01,
+			  channel_flags & ROUTING_FLAGS_DISABLED ? "DISABLED" : "ACTIVE");
 
 	routing_add_channel_update(rstate, take(serialized), 0, peer);
 	return NULL;
@@ -2425,16 +2441,10 @@ bool routing_add_node_announcement(struct routing_state *rstate,
 
 	/* Only log this if *not* loading from store. */
 	if (!index)
-		status_debug("Received node_announcement for node %s",
-			     type_to_string(tmpctx, struct node_id, &node_id));
-
-	/* Check timestamp is sane (unless from gossip_store). */
-	if (!index && !timestamp_reasonable(rstate, timestamp)) {
-		status_debug("Ignoring node_announcement timestamp %u for %s",
-			     timestamp,
-			     type_to_string(tmpctx, struct node_id, &node_id));
-		return false;
-	}
+		status_peer_debug(peer ? &peer->id : NULL,
+				  "Received node_announcement for node %s",
+				  type_to_string(tmpctx, struct node_id,
+						 &node_id));
 
 	node = get_node(rstate, &node_id);
 
@@ -2469,9 +2479,7 @@ bool routing_add_node_announcement(struct routing_state *rstate,
 		pna->index = index;
 		tal_free(pna->node_announcement);
 		clear_softref(pna, &pna->peer_softref);
-		pna->node_announcement = tal_dup_arr(pna, u8, msg,
-						     tal_count(msg),
-						     0);
+		pna->node_announcement = tal_dup_talarr(pna, u8, msg);
 		set_softref(pna, &pna->peer_softref, peer);
 		return true;
 	}
@@ -2492,12 +2500,13 @@ bool routing_add_node_announcement(struct routing_state *rstate,
 		/* Allow redundant updates once every 7 days */
 		if (timestamp < node->bcast.timestamp + GOSSIP_PRUNE_INTERVAL(rstate->dev_fast_gossip_prune) / 2
 		    && !nannounce_different(rstate->gs, node, msg)) {
-			status_debug("Ignoring redundant nannounce for %s"
-				     " (last %u, now %u)",
-				     type_to_string(tmpctx,
-						    struct node_id,
-						    &node_id),
-				     node->bcast.timestamp, timestamp);
+			status_peer_debug(peer ? &peer->id : NULL,
+					  "Ignoring redundant nannounce for %s"
+					  " (last %u, now %u)",
+					  type_to_string(tmpctx,
+							 struct node_id,
+							 &node_id),
+					  node->bcast.timestamp, timestamp);
 			/* Ignoring != failing */
 			return true;
 		}
@@ -2505,12 +2514,13 @@ bool routing_add_node_announcement(struct routing_state *rstate,
 		/* Make sure it's not spamming us. */
 		if (!ratelimit(rstate,
 			       &node->tokens, node->bcast.timestamp, timestamp)) {
-			status_debug("Ignoring spammy nannounce for %s"
-				     " (last %u, now %u)",
-				     type_to_string(tmpctx,
-						    struct node_id,
-						    &node_id),
-				     node->bcast.timestamp, timestamp);
+			status_peer_debug(peer ? &peer->id : NULL,
+					  "Ignoring spammy nannounce for %s"
+					  " (last %u, now %u)",
+					  type_to_string(tmpctx,
+							 struct node_id,
+							 &node_id),
+					  node->bcast.timestamp, timestamp);
 			/* Ignoring != failing */
 			return true;
 		}
@@ -2525,6 +2535,12 @@ bool routing_add_node_announcement(struct routing_state *rstate,
 	if (node->bcast.timestamp > rstate->last_timestamp
 	    && node->bcast.timestamp < time_now().ts.tv_sec)
 		rstate->last_timestamp = node->bcast.timestamp;
+
+	if (feature_offered(features, OPT_VAR_ONION))
+		node->hop_style = ROUTE_HOP_TLV;
+	else
+		/* Reset it in case they no longer offer the feature */
+		node->hop_style = ROUTE_HOP_LEGACY;
 
 	if (index)
 		node->bcast.index = index;
@@ -2574,22 +2590,6 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann,
 		return err;
 	}
 
-	/* BOLT #7:
-	 *
-	 * The receiving node:
-	 *...
-	 *  - if `features` field contains _unknown even bits_:
-	 *    - MUST NOT parse the remainder of the message.
-	 *    - MAY discard the message altogether.
-	 *    - SHOULD NOT connect to the node.
-	 */
-	if (!features_supported(features)) {
-		status_debug("Ignoring node announcement for node %s, unsupported features %s.",
-			     type_to_string(tmpctx, struct node_id, &node_id),
-			     tal_hex(tmpctx, features));
-		return NULL;
-	}
-
 	sha256_double(&hash, serialized + 66, tal_count(serialized) - 66);
 	/* If node_id is invalid, it fails here */
 	if (!check_signed_hash_nodeid(&hash, &signature, &node_id)) {
@@ -2636,20 +2636,20 @@ u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann,
 	return NULL;
 }
 
-struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
-			    const struct node_id *source,
-			    const struct node_id *destination,
-			    struct amount_msat msat, double riskfactor,
-			    u32 final_cltv,
-			    double fuzz, u64 seed,
-			    struct exclude_entry **excluded,
-			    u32 max_hops)
+struct route_hop **get_route(const tal_t *ctx, struct routing_state *rstate,
+			     const struct node_id *source,
+			     const struct node_id *destination,
+			     struct amount_msat msat, double riskfactor,
+			     u32 final_cltv,
+			     double fuzz, u64 seed,
+			     struct exclude_entry **excluded,
+			     u32 max_hops)
 {
 	struct chan **route;
 	struct amount_msat total_amount;
 	unsigned int total_delay;
 	struct amount_msat fee;
-	struct route_hop *hops;
+	struct route_hop **hops;
 	struct node *n;
 	struct amount_msat *saved_capacity;
 	struct short_channel_id_dir *excluded_chan;
@@ -2723,7 +2723,7 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 	}
 
 	/* Fees, delays need to be calculated backwards along route. */
-	hops = tal_arr(ctx, struct route_hop, tal_count(route));
+	hops = tal_arr(ctx, struct route_hop *, tal_count(route));
 	total_amount = msat;
 	total_delay = final_cltv;
 
@@ -2734,11 +2734,15 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 
 		int idx = half_chan_to(n, route[i]);
 		c = &route[i]->half[idx];
-		hops[i].channel_id = route[i]->scid;
-		hops[i].nodeid = n->id;
-		hops[i].amount = total_amount;
-		hops[i].delay = total_delay;
-		hops[i].direction = idx;
+		hops[i] = tal(hops, struct route_hop);
+		hops[i]->channel_id = route[i]->scid;
+		hops[i]->nodeid = n->id;
+		hops[i]->amount = total_amount;
+		hops[i]->delay = total_delay;
+		hops[i]->direction = idx;
+		hops[i]->style = n->hop_style;
+		hops[i]->blinding = NULL;
+		hops[i]->enctlv = NULL;
 
 		/* Since we calculated this route, it should not overflow! */
 		if (!amount_msat_add_fee(&total_amount,
@@ -2756,96 +2760,6 @@ struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 
 	return hops;
 }
-
-void routing_failure(struct routing_state *rstate,
-		     const struct node_id *erring_node_id,
-		     const struct short_channel_id *scid,
-		     int erring_direction,
-		     enum onion_type failcode,
-		     const u8 *channel_update)
-{
-	struct chan **pruned = tal_arr(tmpctx, struct chan *, 0);
-
-	status_debug("Received routing failure 0x%04x (%s), "
-		     "erring node %s, "
-		     "channel %s/%u",
-		     (int) failcode, onion_type_name(failcode),
-		     type_to_string(tmpctx, struct node_id, erring_node_id),
-		     type_to_string(tmpctx, struct short_channel_id, scid),
-		     erring_direction);
-
-	/* lightningd will only extract this if UPDATE is set. */
-	if (channel_update) {
-		u8 *err = handle_channel_update(rstate, channel_update,
-						NULL, NULL);
-		if (err) {
-			status_unusual("routing_failure: "
-				       "bad channel_update %s",
-				       sanitize_error(err, err, NULL));
-			tal_free(err);
-		}
-	} else if (failcode & UPDATE) {
-		status_unusual("routing_failure: "
-			       "UPDATE bit set, no channel_update. "
-			       "failcode: 0x%04x",
-			       (int) failcode);
-	}
-
-	/* We respond to permanent errors, ignore the rest: they're
-	 * for the pay command to worry about.  */
-	if (!(failcode & PERM))
-		return;
-
-	if (failcode & NODE) {
-		struct node *node = get_node(rstate, erring_node_id);
-		if (!node) {
-			status_unusual("routing_failure: Erring node %s not in map",
-				       type_to_string(tmpctx, struct node_id,
-						      erring_node_id));
-		} else {
-			struct chan_map_iter i;
-			struct chan *c;
-
-			status_debug("Deleting node %s",
-				     type_to_string(tmpctx,
-						    struct node_id,
-						    &node->id));
-			for (c = first_chan(node, &i); c; c = next_chan(node, &i)) {
-				/* Set it up to be pruned. */
-				tal_arr_expand(&pruned, c);
-			}
-		}
-	} else {
-		struct chan *chan = get_channel(rstate, scid);
-
-		if (!chan)
-			status_unusual("routing_failure: "
-				       "Channel %s unknown",
-				       type_to_string(tmpctx,
-						      struct short_channel_id,
-						      scid));
-		else {
-			/* This error can be triggered by sendpay if caller
-			 * uses the wrong key for dest. */
-			if (failcode == WIRE_INVALID_ONION_HMAC
-			    && !node_id_eq(&chan->nodes[!erring_direction]->id,
-					   erring_node_id))
-				return;
-
-			status_debug("Deleting channel %s",
-				     type_to_string(tmpctx,
-						    struct short_channel_id,
-						    scid));
-			/* Set it up to be deleted. */
-			tal_arr_expand(&pruned, chan);
-		}
-	}
-
-	/* Now free all the chans and maybe even nodes. */
-	for (size_t i = 0; i < tal_count(pruned); i++)
-		free_chan(rstate, pruned[i]);
-}
-
 
 void route_prune(struct routing_state *rstate)
 {
@@ -2899,31 +2813,37 @@ void route_prune(struct routing_state *rstate)
 }
 
 bool handle_local_add_channel(struct routing_state *rstate,
+			      const struct peer *peer,
 			      const u8 *msg, u64 index)
 {
 	struct short_channel_id scid;
 	struct node_id remote_node_id;
 	struct amount_sat sat;
 	struct chan *chan;
+	u8 *features;
 
-	if (!fromwire_gossipd_local_add_channel(msg, &scid, &remote_node_id,
-						&sat)) {
-		status_broken("Unable to parse local_add_channel message: %s",
-			      tal_hex(msg, msg));
+	if (!fromwire_gossipd_local_add_channel(msg, msg, &scid, &remote_node_id,
+						&sat, &features)) {
+		status_peer_broken(peer ? &peer->id : NULL,
+				  "Unable to parse local_add_channel message: %s",
+				   tal_hex(msg, msg));
 		return false;
 	}
 
 	/* Can happen on channeld restart. */
 	if (get_channel(rstate, &scid)) {
-		status_debug("Attempted to local_add_channel a known channel");
+		status_peer_debug(peer ? &peer->id : NULL,
+				  "Attempted to local_add_channel a known channel");
 		return true;
 	}
 
-	status_debug("local_add_channel %s",
-		     type_to_string(tmpctx, struct short_channel_id, &scid));
+	status_peer_debug(peer ? &peer->id : NULL,
+			  "local_add_channel %s",
+			  type_to_string(tmpctx, struct short_channel_id, &scid));
 
 	/* Create new (unannounced) channel */
-	chan = new_chan(rstate, &scid, &rstate->local_id, &remote_node_id, sat);
+	chan = new_chan(rstate, &scid, &rstate->local_id, &remote_node_id, sat,
+			features);
 	if (!index)
 		index = gossip_store_add(rstate->gs, msg, 0, false, NULL);
 	chan->bcast.index = index;
@@ -2985,7 +2905,7 @@ void remove_all_gossip(struct routing_state *rstate)
 	while ((c = uintmap_first(&rstate->chanmap, &index)) != NULL) {
 		uintmap_del(&rstate->chanmap, index);
 #if DEVELOPER
-		c->sat.satoshis = (unsigned long)c; /* Raw: dev-hack */
+		c->sat = amount_sat((unsigned long)c);
 #endif
 		tal_free(c);
 	}

@@ -1,4 +1,5 @@
 #include <ccan/array_size/array_size.h>
+#include <common/json_helpers.h>
 #include <lightningd/channel.h>
 #include <lightningd/json.h>
 #include <lightningd/notification.h>
@@ -140,6 +141,41 @@ void notify_invoice_payment(struct lightningd *ld, struct amount_msat amount,
 	plugins_notify(ld->plugins, take(n));
 }
 
+static void invoice_creation_notification_serialize(struct json_stream *stream,
+						   struct amount_msat *amount,
+						   struct preimage preimage,
+						   const struct json_escape *label)
+{
+	json_object_start(stream, "invoice_creation");
+	if (amount != NULL)
+		json_add_string(
+		    stream, "msat",
+		    type_to_string(tmpctx, struct amount_msat, amount));
+
+	json_add_hex(stream, "preimage", &preimage, sizeof(preimage));
+	json_add_escaped_string(stream, "label", label);
+	json_object_end(stream);
+}
+
+REGISTER_NOTIFICATION(invoice_creation,
+		      invoice_creation_notification_serialize)
+
+void notify_invoice_creation(struct lightningd *ld, struct amount_msat *amount,
+			     struct preimage preimage,
+			     const struct json_escape *label)
+{
+	void (*serialize)(struct json_stream *,
+			  struct amount_msat *,
+			  struct preimage,
+			  const struct json_escape *) = invoice_creation_notification_gen.serialize;
+
+	struct jsonrpc_notification *n
+		= jsonrpc_notification_start(NULL, invoice_creation_notification_gen.topic);
+	serialize(n->stream, amount, preimage, label);
+	jsonrpc_notification_end(n);
+	plugins_notify(ld->plugins, take(n));
+}
+
 static void channel_opened_notification_serialize(struct json_stream *stream,
 						  struct node_id *node_id,
 						  struct amount_sat *funding_sat,
@@ -176,7 +212,8 @@ void notify_channel_opened(struct lightningd *ld, struct node_id *node_id,
 
 static void forward_event_notification_serialize(struct json_stream *stream,
 						 const struct htlc_in *in,
-						 const struct htlc_out *out,
+						 const struct short_channel_id *scid_out,
+						 const struct amount_msat *amount_out,
 						 enum forward_status state,
 						 enum onion_type failcode,
 						 struct timeabs *resolved_time)
@@ -186,10 +223,17 @@ static void forward_event_notification_serialize(struct json_stream *stream,
 	struct forwarding *cur = tal(tmpctx, struct forwarding);
 	cur->channel_in = *in->key.channel->scid;
 	cur->msat_in = in->msat;
-	if (out) {
-		cur->channel_out = *out->key.channel->scid;
-		cur->msat_out = out->msat;
-		assert(amount_msat_sub(&cur->fee, in->msat, out->msat));
+	if (scid_out) {
+		cur->channel_out = *scid_out;
+		if (amount_out) {
+			cur->msat_out = *amount_out;
+			if (!amount_msat_sub(&cur->fee,
+					     in->msat, *amount_out))
+				abort();
+		} else {
+			cur->msat_out = AMOUNT_MSAT(0);
+			cur->fee = AMOUNT_MSAT(0);
+		}
 	} else {
 		cur->channel_out.u64 = 0;
 		cur->msat_out = AMOUNT_MSAT(0);
@@ -209,21 +253,23 @@ REGISTER_NOTIFICATION(forward_event,
 
 void notify_forward_event(struct lightningd *ld,
 			  const struct htlc_in *in,
-			  const struct htlc_out *out,
+			  const struct short_channel_id *scid_out,
+			  const struct amount_msat *amount_out,
 			  enum forward_status state,
 			  enum onion_type failcode,
 			  struct timeabs *resolved_time)
 {
 	void (*serialize)(struct json_stream *,
 			  const struct htlc_in *,
-			  const struct htlc_out *,
+			  const struct short_channel_id *,
+			  const struct amount_msat *,
 			  enum forward_status,
 			  enum onion_type,
 			  struct timeabs *) = forward_event_notification_gen.serialize;
 
 	struct jsonrpc_notification *n
 		= jsonrpc_notification_start(NULL, forward_event_notification_gen.topic);
-	serialize(n->stream, in, out, state, failcode, resolved_time);
+	serialize(n->stream, in, scid_out, amount_out, state, failcode, resolved_time);
 	jsonrpc_notification_end(n);
 	plugins_notify(ld->plugins, take(n));
 }
@@ -254,8 +300,8 @@ void notify_sendpay_success(struct lightningd *ld,
 
 static void sendpay_failure_notification_serialize(struct json_stream *stream,
 						   const struct wallet_payment *payment,
-						   int pay_errcode,
-						   const u8 *onionreply,
+						   errcode_t pay_errcode,
+						   const struct onionreply *onionreply,
 						   const struct routing_failure *fail,
 						   char *errmsg)
 {
@@ -263,7 +309,7 @@ static void sendpay_failure_notification_serialize(struct json_stream *stream,
 
 	/* In line with the format of json error returned
 	 * by sendpay_fail(). */
-	json_add_member(stream, "code", false, "%d", pay_errcode);
+	json_add_member(stream, "code", false, "%" PRIerrcode, pay_errcode);
 	json_add_string(stream, "message", errmsg);
 
 	json_object_start(stream, "data");
@@ -282,21 +328,98 @@ REGISTER_NOTIFICATION(sendpay_failure,
 
 void notify_sendpay_failure(struct lightningd *ld,
 			    const struct wallet_payment *payment,
-			    int pay_errcode,
-			    const u8 *onionreply,
+			    errcode_t pay_errcode,
+			    const struct onionreply *onionreply,
 			    const struct routing_failure *fail,
-			    char *errmsg)
+			    const char *errmsg)
 {
 	void (*serialize)(struct json_stream *,
 			  const struct wallet_payment *,
-			  int,
-			  const u8 *,
+			  errcode_t,
+			  const struct onionreply *,
 			  const struct routing_failure *,
-			  char *) = sendpay_failure_notification_gen.serialize;
+			  const char *) = sendpay_failure_notification_gen.serialize;
 
 	struct jsonrpc_notification *n =
 	    jsonrpc_notification_start(NULL, "sendpay_failure");
 	serialize(n->stream, payment, pay_errcode, onionreply, fail, errmsg);
+	jsonrpc_notification_end(n);
+	plugins_notify(ld->plugins, take(n));
+}
+
+static void json_mvt_id(struct json_stream *stream, enum mvt_type mvt_type,
+			struct mvt_id *id)
+{
+	switch (mvt_type) {
+		case CHAIN_MVT:
+			/* some 'journal entries' don't have a txid */
+			if (id->tx_txid)
+				json_add_string(stream, "txid",
+						type_to_string(tmpctx, struct bitcoin_txid,
+							       id->tx_txid));
+			/* some chain ledger entries aren't associated with a utxo
+			 * e.g. journal updates (due to penalty/state loss) and
+			 * chain_fee entries */
+			if (id->output_txid) {
+				json_add_string(stream, "utxo_txid",
+						type_to_string(tmpctx, struct bitcoin_txid,
+							       id->output_txid));
+				json_add_u32(stream, "vout", id->vout);
+			}
+
+			/* on-chain htlcs include a payment hash */
+			if (id->payment_hash)
+				json_add_sha256(stream, "payment_hash", id->payment_hash);
+			return;
+		case CHANNEL_MVT:
+			json_add_sha256(stream, "payment_hash", id->payment_hash);
+			if (id->part_id)
+				json_add_u64(stream, "part_id", *id->part_id);
+			return;
+	}
+	abort();
+}
+
+static void coin_movement_notification_serialize(struct json_stream *stream,
+						 struct coin_mvt *mvt)
+{
+	json_object_start(stream, "coin_movement");
+	json_add_num(stream, "version", mvt->version);
+	json_add_node_id(stream, "node_id", mvt->node_id);
+	json_add_u64(stream, "movement_idx", mvt->counter);
+	json_add_string(stream, "type", mvt_type_str(mvt->type));
+	json_add_string(stream, "account_id", mvt->account_id);
+	json_mvt_id(stream, mvt->type, &mvt->id);
+	json_add_amount_msat_only(stream, "credit", mvt->credit);
+	json_add_amount_msat_only(stream, "debit", mvt->debit);
+	json_add_string(stream, "tag", mvt_tag_str(mvt->tag));
+
+	/* Only chain movements have blockheights. A blockheight
+	 * of 'zero' means we haven't seen this tx confirmed yet. */
+	if (mvt->type == CHAIN_MVT) {
+		if (mvt->blockheight)
+			json_add_u32(stream, "blockheight", mvt->blockheight);
+		else
+			json_add_null(stream, "blockheight");
+	}
+	json_add_u32(stream, "timestamp", mvt->timestamp);
+	json_add_string(stream, "coin_type", mvt->bip173_name);
+
+	json_object_end(stream);
+}
+
+REGISTER_NOTIFICATION(coin_movement,
+		      coin_movement_notification_serialize);
+
+void notify_coin_mvt(struct lightningd *ld,
+		     const struct coin_mvt *mvt)
+{
+	void (*serialize)(struct json_stream *,
+			  const struct coin_mvt *) = coin_movement_notification_gen.serialize;
+
+	struct jsonrpc_notification *n =
+		jsonrpc_notification_start(NULL, "coin_movement");
+	serialize(n->stream, mvt);
 	jsonrpc_notification_end(n);
 	plugins_notify(ld->plugins, take(n));
 }

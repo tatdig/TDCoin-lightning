@@ -10,6 +10,7 @@
 #include <ccan/list/list.h>
 #include <ccan/tal/tal.h>
 #include <common/channel_config.h>
+#include <common/penalty_base.h>
 #include <common/utxo.h>
 #include <common/wallet.h>
 #include <lightningd/bitcoind.h>
@@ -50,6 +51,9 @@ struct wallet {
 
 	/* Unreleased txs, waiting for txdiscard/txsend */
 	struct list_head unreleased_txs;
+
+	/* How many keys should we look ahead at most? */
+	u64 keyscan_gap;
 };
 
 /* A transaction we've txprepared, but  haven't signed and released yet */
@@ -63,8 +67,6 @@ struct unreleased_tx {
 	/* The tx itself (unsigned initially) */
 	struct bitcoin_tx *tx;
 	struct bitcoin_txid txid;
-	/* Index of change output, or -1 if none. */
-	int change_outnum;
 };
 
 /* Possible states for tracked outputs in the database. Not sure yet
@@ -249,11 +251,18 @@ struct wallet_payment {
 	struct list_node list;
 	u64 id;
 	u32 timestamp;
+
+	/* The combination of these two fields is unique: */
 	struct sha256 payment_hash;
+	u64 partid;
+
 	enum wallet_payment_status status;
-	struct node_id destination;
+
+	/* The destination may not be known if we used `sendonion` */
+	struct node_id *destination;
 	struct amount_msat msatoshi;
 	struct amount_msat msatoshi_sent;
+	struct amount_msat total_msat;
 	/* If and only if PAYMENT_COMPLETE */
 	struct preimage *payment_preimage;
 	/* Needed for recovering from routing failures. */
@@ -265,6 +274,9 @@ struct wallet_payment {
 
 	/* The label of the payment. Must support `tal_len` */
 	const char *label;
+
+	/* If we could not decode the fail onion, just add it here. */
+	const u8 *failonion;
 };
 
 struct outpoint {
@@ -319,16 +331,8 @@ struct wallet_transaction {
  * This is guaranteed to either return a valid wallet, or abort with
  * `fatal` if it cannot be initialized.
  */
-struct wallet *wallet_new(struct lightningd *ld,
-			  struct log *log, struct timers *timers);
-
-/**
- * wallet_add_utxo - Register an UTXO which we (partially) own
- *
- * Add an UTXO to the set of outputs we care about.
- */
-bool wallet_add_utxo(struct wallet *w, struct utxo *utxo,
-		     enum wallet_output_type type);
+struct wallet *wallet_new(struct lightningd *ld, struct timers *timers,
+			  struct ext_key *bip32_base);
 
 /**
  * wallet_confirm_tx - Confirm a tx which contains a UTXO.
@@ -371,6 +375,72 @@ struct utxo **wallet_get_utxos(const tal_t *ctx, struct wallet *w,
 struct utxo **wallet_get_unconfirmed_closeinfo_utxos(const tal_t *ctx,
 						     struct wallet *w);
 
+/**
+ * wallet_find_utxo - Select an available UTXO (does not reserve it!).
+ * @ctx: tal context
+ * @w: wallet
+ * @current_blockheight: current chain length.
+ * @amount_we_are_short: optional amount.
+ * @feerate_per_kw: feerate we are using.
+ * @maxheight: zero (if caller doesn't care) or maximum blockheight to accept.
+ * @excludes: UTXOs not to consider.
+ *
+ * If @amount_we_are_short is not NULL, we try to get something very close
+ * (i.e. when we add this input, we will add => @amount_we_are_short, but
+ * less than @amount_we_are_short + dustlimit).
+ *
+ * Otherwise we give a random UTXO.
+ */
+struct utxo *wallet_find_utxo(const tal_t *ctx, struct wallet *w,
+			      unsigned current_blockheight,
+			      struct amount_sat *amount_we_are_short,
+			      unsigned feerate_per_kw,
+			      u32 maxheight,
+			      const struct utxo **excludes);
+
+/**
+ * wallet_add_onchaind_utxo - Add a UTXO with spending info from onchaind.
+ *
+ * Usually we add UTXOs by looking at transactions, but onchaind tells
+ * us about other UTXOs we can spend with some extra metadata.
+ *
+ * Returns false if we already have it in db (that's fine).
+ */
+bool wallet_add_onchaind_utxo(struct wallet *w,
+			      const struct bitcoin_txid *txid,
+			      u32 outnum,
+			      const u8 *scriptpubkey,
+			      u32 blockheight,
+			      struct amount_sat amount,
+			      const struct channel *chan,
+			      /* NULL if option_static_remotekey */
+			      const struct pubkey *commitment_point);
+
+/**
+ * wallet_reserve_utxo - set a reservation on a UTXO.
+ *
+ * If the reservation is already reserved, refreshes the reservation,
+ * otherwise if it's not available, returns false.
+ */
+bool wallet_reserve_utxo(struct wallet *w,
+			 struct utxo *utxo,
+			 u32 reservation_blocknum);
+
+/* wallet_unreserve_utxo - make a reserved UTXO available again.
+ *
+ * Must be reserved.
+ */
+void wallet_unreserve_utxo(struct wallet *w, struct utxo *utxo,
+			   u32 current_height);
+
+/** wallet_utxo_get - Retrive a utxo.
+ *
+ * Returns a utxo, or NULL if not found.
+ */
+struct utxo *wallet_utxo_get(const tal_t *ctx, struct wallet *w,
+			     const struct bitcoin_txid *txid,
+			     u32 outnum);
+
 const struct utxo **wallet_select_coins(const tal_t *ctx, struct wallet *w,
 					bool with_change,
 					struct amount_sat value,
@@ -386,6 +456,14 @@ const struct utxo **wallet_select_all(const tal_t *ctx, struct wallet *w,
 				      u32 maxheight,
 				      struct amount_sat *sat,
 				      struct amount_sat *fee_estimate);
+
+/* derive_redeem_scriptsig - Compute the scriptSig for a P2SH-P2WPKH
+ *
+ * @ctx - allocation context
+ * @w - wallet
+ * @keyindex - index of the internal BIP32 key
+ */
+u8 *derive_redeem_scriptsig(const tal_t *ctx, struct wallet *w, u32 keyindex);
 
 /**
  * wallet_select_specific - Select utxos given an array of txids and an array of outputs index
@@ -410,7 +488,7 @@ void wallet_confirm_utxos(struct wallet *w, const struct utxo **utxos);
  *
  * FIXME: This is very slow with lots of inputs!
  *
- * @w: (in) allet holding the pubkeys to check against (privkeys are on HSM)
+ * @w: (in) wallet holding the pubkeys to check against (privkeys are on HSM)
  * @script: (in) the script to check
  * @index: (out) the bip32 derivation index that matched the script
  * @output_is_p2sh: (out) whether the script is a p2sh, or p2wpkh
@@ -533,7 +611,7 @@ void wallet_blocks_heights(struct wallet *w, u32 def, u32 *min, u32 *max);
 /**
  * wallet_extract_owned_outputs - given a tx, extract all of our outputs
  */
-int wallet_extract_owned_outputs(struct wallet *w, const struct bitcoin_tx *tx,
+int wallet_extract_owned_outputs(struct wallet *w, const struct wally_tx *tx,
 				 const u32 *blockheight,
 				 struct amount_sat *total);
 
@@ -572,42 +650,53 @@ void wallet_htlc_save_out(struct wallet *wallet,
  * @new_state: the state we should transition to
  * @payment_key: the `payment_key` which hashes to the `payment_hash`,
  *   or NULL if unknown.
- * @failcode: the current failure code, or 0.
- * @failuremsg: the current failure message (from peer), or NULL.
+ * @badonion: the current BADONION failure code, or 0.
+ * @failonion: the current failure onion message (from peer), or NULL.
+ * @failmsg: the current local failure message, or NULL.
+ * @we_filled: for htlc-ins, true if we originated the preimage.
  *
  * Used to update the state of an HTLC, either a `struct htlc_in` or a
  * `struct htlc_out` and optionally set the `payment_key` should the
- * HTLC have been settled, or `failcode`/`failuremsg` if failed.
+ * HTLC have been settled, or `failcode`/`failonion` if failed.
  */
 void wallet_htlc_update(struct wallet *wallet, const u64 htlc_dbid,
 			const enum htlc_state new_state,
 			const struct preimage *payment_key,
-			enum onion_type failcode, const u8 *failuremsg);
+			enum onion_type badonion,
+			const struct onionreply *failonion,
+			const u8 *failmsg,
+			bool *we_filled);
 
 /**
- * wallet_htlcs_load_for_channel - Load HTLCs associated with chan from DB.
+ * wallet_htlcs_load_in_for_channel - Load incoming HTLCs associated with chan from DB.
  *
  * @wallet: wallet to load from
  * @chan: load HTLCs associated with this channel
  * @htlcs_in: htlc_in_map to store loaded htlc_in in
- * @htlcs_out: htlc_out_map to store loaded htlc_out in
  *
- * This function looks for HTLCs that are associated with the given
- * channel and loads them into the provided maps. One caveat is that
- * the `struct htlc_out` instances are not wired up with the
- * corresponding `struct htlc_in` in the forwarding case nor are they
- * associated with a `struct pay_command` in the case we originated
- * the payment. In the former case the corresponding `struct htlc_in`
- * may not have been loaded yet. In the latter case the pay_command
- * does not exist anymore since we restarted.
- *
- * Use `htlcs_reconnect` to wire htlc_out instances to the
- * corresponding htlc_in after loading all channels.
+ * This function looks for incoming HTLCs that are associated with the given
+ * channel and loads them into the provided map.
  */
-bool wallet_htlcs_load_for_channel(struct wallet *wallet,
-				   struct channel *chan,
-				   struct htlc_in_map *htlcs_in,
-				   struct htlc_out_map *htlcs_out);
+bool wallet_htlcs_load_in_for_channel(struct wallet *wallet,
+				      struct channel *chan,
+				      struct htlc_in_map *htlcs_in);
+
+/**
+ * wallet_htlcs_load_out_for_channel - Load outgoing HTLCs associated with chan from DB.
+ *
+ * @wallet: wallet to load from
+ * @chan: load HTLCs associated with this channel
+ * @htlcs_out: htlc_out_map to store loaded htlc_out in.
+ * @remaining_htlcs_in: htlc_in_map with unconnected htlcs (removed as we progress)
+ *
+ * We populate htlc_out->in by looking up in remaining_htlcs_in.  It's
+ * possible that it's still NULL, since we can have outgoing HTLCs
+ * outlive their corresponding incoming.
+ */
+bool wallet_htlcs_load_out_for_channel(struct wallet *wallet,
+				       struct channel *chan,
+				       struct htlc_out_map *htlcs_out,
+				       struct htlc_in_map *remaining_htlcs_in);
 
 /**
  * wallet_announcement_save - Save remote announcement information with channel.
@@ -674,6 +763,8 @@ struct invoice_details {
 
 	/* The description of the payment. */
 	char *description;
+	/* The features, if any (tal_arr) */
+	u8 *features;
 };
 
 /* An object that handles iteration over the set of invoices */
@@ -714,6 +805,7 @@ bool wallet_invoice_create(struct wallet *wallet,
 			   u64 expiry,
 			   const char *b11enc,
 			   const char *description,
+			   const u8 *features,
 			   const struct preimage *r,
 			   const struct sha256 *rhash);
 
@@ -923,7 +1015,7 @@ void wallet_payment_setup(struct wallet *wallet, struct wallet_payment *payment)
  * Stores the payment in the database.
  */
 void wallet_payment_store(struct wallet *wallet,
-			  const struct sha256 *payment_hash);
+			  struct wallet_payment *payment TAKES);
 
 /**
  * wallet_payment_delete - Remove a payment
@@ -931,7 +1023,8 @@ void wallet_payment_store(struct wallet *wallet,
  * Removes the payment from the database.
  */
 void wallet_payment_delete(struct wallet *wallet,
-			   const struct sha256 *payment_hash);
+			   const struct sha256 *payment_hash,
+			   u64 partid);
 
 /**
  * wallet_local_htlc_out_delete - Remove a local outgoing failed HTLC
@@ -942,7 +1035,8 @@ void wallet_payment_delete(struct wallet *wallet,
  */
 void wallet_local_htlc_out_delete(struct wallet *wallet,
 				  struct channel *chan,
-				  const struct sha256 *payment_hash);
+				  const struct sha256 *payment_hash,
+				  u64 partid);
 
 /**
  * wallet_payment_by_hash - Retrieve a specific payment
@@ -951,7 +1045,8 @@ void wallet_local_htlc_out_delete(struct wallet *wallet,
  */
 struct wallet_payment *
 wallet_payment_by_hash(const tal_t *ctx, struct wallet *wallet,
-				const struct sha256 *payment_hash);
+		       const struct sha256 *payment_hash,
+		       u64 partid);
 
 /**
  * wallet_payment_set_status - Update the status of the payment
@@ -960,9 +1055,10 @@ wallet_payment_by_hash(const tal_t *ctx, struct wallet *wallet,
  * its state.
  */
 void wallet_payment_set_status(struct wallet *wallet,
-				const struct sha256 *payment_hash,
-			        const enum wallet_payment_status newstatus,
-			        const struct preimage *preimage);
+			       const struct sha256 *payment_hash,
+			       u64 partid,
+			       const enum wallet_payment_status newstatus,
+			       const struct preimage *preimage);
 
 /**
  * wallet_payment_get_failinfo - Get failure information for a given
@@ -974,8 +1070,9 @@ void wallet_payment_set_status(struct wallet *wallet,
 void wallet_payment_get_failinfo(const tal_t *ctx,
 				 struct wallet *wallet,
 				 const struct sha256 *payment_hash,
+				 u64 partid,
 				 /* outputs */
-				 u8 **failonionreply,
+				 struct onionreply **failonionreply,
 				 bool *faildestperm,
 				 int *failindex,
 				 enum onion_type *failcode,
@@ -990,7 +1087,8 @@ void wallet_payment_get_failinfo(const tal_t *ctx,
  */
 void wallet_payment_set_failinfo(struct wallet *wallet,
 				 const struct sha256 *payment_hash,
-				 const u8 *failonionreply,
+				 u64 partid,
+				 const struct onionreply *failonionreply,
 				 bool faildestperm,
 				 int failindex,
 				 enum onion_type failcode,
@@ -1013,7 +1111,7 @@ const struct wallet_payment **wallet_payment_list(const tal_t *ctx,
  * wallet_htlc_sigs_save - Store the latest HTLC sigs for the channel
  */
 void wallet_htlc_sigs_save(struct wallet *w, u64 channel_id,
-			   secp256k1_ecdsa_signature *htlc_sigs);
+			   const struct bitcoin_signature *htlc_sigs);
 
 /**
  * wallet_network_check - Check that the wallet is setup for this chain
@@ -1022,8 +1120,7 @@ void wallet_htlc_sigs_save(struct wallet *w, u64 channel_id,
  * genesis_hash with which the DB was initialized. Returns false if
  * the check failed, i.e., if the genesis hashes do not match.
  */
-bool wallet_network_check(struct wallet *w,
-			  const struct chainparams *chainparams);
+bool wallet_network_check(struct wallet *w);
 
 /**
  * wallet_block_add - Add a block to the blockchain tracked by this wallet
@@ -1051,12 +1148,14 @@ bool wallet_have_block(struct wallet *w, u32 blockheight);
  * Given the outpoint (txid, outnum), and the blockheight, mark the
  * corresponding DB entries as spent at the blockheight.
  *
+ * @our_spend - set to true if found in our wallet's output set, false otherwise
  * @return scid The short_channel_id corresponding to the spent outpoint, if
  *         any.
  */
 const struct short_channel_id *
 wallet_outpoint_spend(struct wallet *w, const tal_t *ctx, const u32 blockheight,
-		      const struct bitcoin_txid *txid, const u32 outnum);
+		      const struct bitcoin_txid *txid, const u32 outnum,
+		      bool *our_spend);
 
 struct outpoint *wallet_outpoint_for_scid(struct wallet *w, tal_t *ctx,
 					  const struct short_channel_id *scid);
@@ -1066,7 +1165,7 @@ void wallet_utxoset_add(struct wallet *w, const struct bitcoin_tx *tx,
 			const u32 txindex, const u8 *scriptpubkey,
 			struct amount_sat sat);
 
-void wallet_transaction_add(struct wallet *w, const struct bitcoin_tx *tx,
+void wallet_transaction_add(struct wallet *w, const struct wally_tx *tx,
 			    const u32 blockheight, const u32 txindex);
 
 void wallet_annotate_txout(struct wallet *w, const struct bitcoin_txid *txid,
@@ -1096,6 +1195,15 @@ void wallet_transaction_annotate(struct wallet *w,
  */
 bool wallet_transaction_type(struct wallet *w, const struct bitcoin_txid *txid,
 			     enum wallet_tx_type *type);
+
+/**
+ * Get the transaction from the database
+ *
+ * Looks up a transaction we have in the database and returns it, or NULL if
+ * not found.
+ */
+struct bitcoin_tx *wallet_transaction_get(const tal_t *ctx, struct wallet *w,
+					  const struct bitcoin_txid *txid);
 
 /**
  * Get the confirmation height of a transaction we are watching by its
@@ -1140,6 +1248,7 @@ struct channeltx *wallet_channeltxs_get(struct wallet *w, const tal_t *ctx,
  * Add of update a forwarded_payment
  */
 void wallet_forwarded_payment_add(struct wallet *w, const struct htlc_in *in,
+				  const struct short_channel_id *scid_out,
 				  const struct htlc_out *out,
 				  enum forward_status state,
 				  enum onion_type failcode);
@@ -1188,6 +1297,20 @@ void add_unreleased_tx(struct wallet *w, struct unreleased_tx *utx);
 /* These will touch the db, so need to be explicitly freed. */
 void free_unreleased_txs(struct wallet *w);
 
+/* wallet_persist_utxo_reservation - Removes destructor
+ *
+ * Persists the reservation in the database (until a restart)
+ * instead of clearing the reservation when the utxo object
+ * is destroyed */
+void wallet_persist_utxo_reservation(struct wallet *w, const struct utxo **utxos);
+
+/* wallet_unreserve_output - Unreserve a utxo
+ *
+ * We unreserve utxos so that they can be spent elsewhere.
+ * */
+bool wallet_unreserve_output(struct wallet *w,
+			     const struct bitcoin_txid *txid,
+			     const u32 outnum);
 /**
  * Get a list of transactions that we track in the wallet.
  *
@@ -1203,5 +1326,29 @@ struct wallet_transaction *wallet_transactions_get(struct wallet *w, const tal_t
  * This can be used to backfill the blocks and still unspent UTXOs that were before our wallet birth height.
  */
 void wallet_filteredblock_add(struct wallet *w, const struct filteredblock *fb);
+
+/**
+ * Store a penalty base in the database.
+ *
+ * Required to eventually create a penalty transaction when we get a
+ * revocation.
+ */
+void wallet_penalty_base_add(struct wallet *w, u64 chan_id,
+			     const struct penalty_base *pb);
+
+/**
+ * Retrieve all pending penalty bases for a given channel.
+ *
+ * This list should stay relatively small since we remove items from it as we
+ * get revocations. We retrieve this list whenever we start a new `channeld`.
+ */
+struct penalty_base *wallet_penalty_base_load_for_channel(const tal_t *ctx,
+							  struct wallet *w,
+							  u64 chan_id);
+
+/**
+ * Delete a penalty_base, after we created and delivered it to the hook.
+ */
+void wallet_penalty_base_delete(struct wallet *w, u64 chan_id, u64 commitnum);
 
 #endif /* LIGHTNING_WALLET_WALLET_H */

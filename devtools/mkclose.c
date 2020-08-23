@@ -23,7 +23,9 @@
 
 static bool verbose = false;
 
-void status_fmt(enum log_level level, const char *fmt, ...)
+void status_fmt(enum log_level level,
+		const struct node_id *node_id,
+		const char *fmt, ...)
 {
 	if (verbose) {
 		va_list ap;
@@ -68,6 +70,7 @@ int main(int argc, char *argv[])
 	const u8 *funding_wscript;
 	const struct chainparams *chainparams = chainparams_for_network("bitcoin");
 	const struct amount_sat dust_limit = AMOUNT_SAT(546);
+	bool option_anchor_outputs = false;
 
 	setup_locale();
 
@@ -115,7 +118,17 @@ int main(int argc, char *argv[])
 		errx(1, "Parsing remote-close-pubkey");
 	argnum++;
 
-	fee = commit_tx_base_fee(feerate_per_kw, 0);
+	fee = commit_tx_base_fee(feerate_per_kw, 0,
+				 option_anchor_outputs);
+	/* BOLT-a12da24dd0102c170365124782b46d9710950ac1:
+	 * If `option_anchor_outputs` applies to the commitment
+	 * transaction, also subtract two times the fixed anchor size
+	 * of 330 sats from the funder (either `to_local` or
+	 * `to_remote`).
+	 */
+	if (option_anchor_outputs && !amount_sat_add(&fee, fee, AMOUNT_SAT(660)))
+		errx(1, "Can't afford anchors");
+
 	if (!amount_msat_sub_sat(&local_msat, local_msat, fee))
 		errx(1, "Can't afford fee %s",
 		     type_to_string(NULL, struct amount_sat, &fee));
@@ -126,18 +139,14 @@ int main(int argc, char *argv[])
 	    || !pubkey_from_privkey(&funding_privkey[REMOTE], &funding_pubkey[REMOTE]))
 		errx(1, "Bad deriving funding pubkeys");
 
-	tx = bitcoin_tx(NULL, chainparams, 1, 2);
-
-	/* Our input spends the anchor tx output. */
-	bitcoin_tx_add_input(tx, &funding_txid, funding_outnum,
-			     BITCOIN_TX_DEFAULT_SEQUENCE, funding_amount, NULL);
+	tx = bitcoin_tx(NULL, chainparams, 1, 2, 0);
 
 	num_outputs = 0;
 	if (amount_msat_greater_eq_sat(local_msat, dust_limit)) {
 		u8 *script = scriptpubkey_p2wpkh(NULL, &outkey[LOCAL]);
 		printf("# local witness script: %s\n", tal_hex(NULL, script));
 		/* One output is to us. */
-		bitcoin_tx_add_output(tx, script,
+		bitcoin_tx_add_output(tx, script, NULL,
 				      amount_msat_to_sat_round_down(local_msat));
 		num_outputs++;
 	} else
@@ -147,7 +156,7 @@ int main(int argc, char *argv[])
 		u8 *script = scriptpubkey_p2wpkh(NULL, &outkey[REMOTE]);
 		printf("# remote witness script: %s\n", tal_hex(NULL, script));
 		/* Other output is to them. */
-		bitcoin_tx_add_output(tx, script,
+		bitcoin_tx_add_output(tx, script, NULL,
 				      amount_msat_to_sat_round_down(remote_msat));
 		num_outputs++;
 	} else
@@ -163,8 +172,11 @@ int main(int argc, char *argv[])
 	printf("# funding witness script = %s\n",
 	       tal_hex(NULL, funding_wscript));
 
-	/* Need input amount for signing */
-	tx->input_amounts[0] = tal_dup(tx, struct amount_sat, &funding_amount);
+	/* Our input spends the anchor tx output. */
+	bitcoin_tx_add_input(tx, &funding_txid, funding_outnum,
+			     BITCOIN_TX_DEFAULT_SEQUENCE, NULL,
+			     funding_amount, NULL, funding_wscript);
+
 	sign_tx_input(tx, 0, NULL, funding_wscript,
 		      &funding_privkey[LOCAL],
 		      &funding_pubkey[LOCAL],

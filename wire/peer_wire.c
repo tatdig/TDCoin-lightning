@@ -1,3 +1,4 @@
+#include <bitcoin/block.h>
 #include <wire/peer_wire.h>
 
 static bool unknown_type(enum wire_type t)
@@ -31,6 +32,9 @@ static bool unknown_type(enum wire_type t)
 	case WIRE_QUERY_CHANNEL_RANGE:
 	case WIRE_REPLY_CHANNEL_RANGE:
 	case WIRE_GOSSIP_TIMESTAMP_FILTER:
+#if EXPERIMENTAL_FEATURES
+	case WIRE_ONION_MESSAGE:
+#endif
 		return false;
 	}
 	return true;
@@ -68,6 +72,9 @@ bool is_msg_for_gossipd(const u8 *cursor)
 	case WIRE_CHANNEL_REESTABLISH:
 	case WIRE_ANNOUNCEMENT_SIGNATURES:
 	case WIRE_GOSSIP_TIMESTAMP_FILTER:
+#if EXPERIMENTAL_FEATURES
+	case WIRE_ONION_MESSAGE:
+#endif
 		break;
 	}
 	return false;
@@ -91,9 +98,12 @@ bool extract_channel_id(const u8 *in_pkt, struct channel_id *channel_id)
 	u8 ignored_u8;
 	struct pubkey ignored_pubkey;
 	struct bitcoin_blkid ignored_chainhash;
+	struct secret ignored_secret;
+	struct tlv_open_channel_tlvs *tlvs = tlv_open_channel_tlvs_new(tmpctx);
 
 	if (fromwire_channel_reestablish(in_pkt, channel_id,
-					 &ignored_u64, &ignored_u64))
+					 &ignored_u64, &ignored_u64,
+					 &ignored_secret, &ignored_pubkey))
 		return true;
 	if (fromwire_open_channel(in_pkt, &ignored_chainhash,
 				  channel_id, &ignored_sat,
@@ -104,7 +114,7 @@ bool extract_channel_id(const u8 *in_pkt, struct channel_id *channel_id)
 				  &ignored_pubkey, &ignored_pubkey,
 				  &ignored_pubkey, &ignored_pubkey,
 				  &ignored_pubkey, &ignored_pubkey,
-				  &ignored_u8))
+				  &ignored_u8, tlvs))
 		return true;
 	return false;
 }

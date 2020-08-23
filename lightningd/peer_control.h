@@ -36,14 +36,11 @@ struct peer {
 	/* Our (only) uncommitted channel, still opening. */
 	struct uncommitted_channel *uncommitted_channel;
 
-	/* History */
-	struct log_book *log_book;
-
 	/* Where we connected to, or it connected from. */
 	struct wireaddr_internal addr;
 
 	/* We keep a copy of their feature bits */
-	const u8 *features;
+	const u8 *their_features;
 
 	/* If we open a channel our direction will be this */
 	u8 direction;
@@ -96,6 +93,12 @@ struct htlc_in_map *load_channels_from_wallet(struct lightningd *ld);
 
 #if DEVELOPER
 void peer_dev_memleak(struct command *cmd);
+void handle_custommsg_in(struct lightningd *ld, const struct node_id *peer_id,
+			 const u8 *msg);
 #endif /* DEVELOPER */
+
+/* Triggered at each new block.  */
+void waitblockheight_notify_new_block(struct lightningd *ld,
+				      u32 block_height);
 
 #endif /* LIGHTNING_LIGHTNINGD_PEER_CONTROL_H */

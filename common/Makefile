@@ -2,12 +2,16 @@ COMMON_SRC_NOGEN :=				\
 	common/addr.c				\
 	common/amount.c				\
 	common/base32.c				\
+	common/base64.c				\
 	common/bech32.c				\
 	common/bech32_util.c			\
 	common/bigsize.c			\
 	common/bip32.c				\
+	common/blinding.c			\
 	common/bolt11.c				\
 	common/channel_config.c			\
+	common/channel_id.c			\
+	common/coin_mvt.c			\
 	common/close_tx.c			\
 	common/configdir.c			\
 	common/crypto_state.c			\
@@ -18,11 +22,14 @@ COMMON_SRC_NOGEN :=				\
 	common/decode_array.c			\
 	common/derive_basepoints.c		\
 	common/dev_disconnect.c			\
+	common/ecdh_hsmd.c			\
 	common/features.c			\
+	common/fee_states.c			\
 	common/funding_tx.c			\
 	common/gossip_rcvd_filter.c		\
 	common/gossip_store.c			\
 	common/hash_u5.c			\
+	common/hmac.c				\
 	common/htlc_state.c			\
 	common/htlc_trim.c			\
 	common/htlc_tx.c			\
@@ -32,20 +39,26 @@ COMMON_SRC_NOGEN :=				\
 	common/io_lock.c			\
 	common/json.c				\
 	common/json_helpers.c			\
+	common/json_stream.c			\
 	common/json_tok.c			\
 	common/key_derive.c			\
 	common/keyset.c				\
 	common/memleak.c			\
 	common/msg_queue.c			\
 	common/node_id.c			\
+	common/onion.c				\
+	common/onionreply.c			\
 	common/param.c				\
+	common/penalty_base.c			\
 	common/per_peer_state.c			\
 	common/peer_billboard.c			\
 	common/peer_failed.c			\
 	common/permute_tx.c			\
 	common/ping.c				\
+	common/psbt_open.c			\
 	common/pseudorand.c			\
 	common/read_peer_msg.c			\
+	common/setup.c				\
 	common/socket_close.c			\
 	common/sphinx.c				\
 	common/status.c				\
@@ -64,7 +77,16 @@ COMMON_SRC_NOGEN :=				\
 
 COMMON_SRC_GEN := common/gen_status_wire.c common/gen_peer_status_wire.c
 
-COMMON_HEADERS_NOGEN := $(COMMON_SRC_NOGEN:.c=.h) common/overflows.h common/htlc.h common/status_levels.h common/json_command.h common/jsonrpc_errors.h common/gossip_constants.h
+COMMON_HEADERS_NOGEN := $(COMMON_SRC_NOGEN:.c=.h)	\
+	common/closing_fee.h				\
+	common/ecdh.h					\
+	common/errcode.h				\
+	common/gossip_constants.h			\
+	common/htlc.h					\
+	common/json_command.h				\
+	common/jsonrpc_errors.h				\
+	common/overflows.h				\
+	common/status_levels.h
 COMMON_HEADERS_GEN := common/gen_htlc_state_names.h common/gen_status_wire.h common/gen_peer_status_wire.h
 
 COMMON_HEADERS := $(COMMON_HEADERS_GEN) $(COMMON_HEADERS_NOGEN)
@@ -74,6 +96,9 @@ COMMON_OBJS := $(COMMON_SRC:.c=.o)
 
 # Common objects depends on bitcoin/ external/ and ccan
 $(COMMON_OBJS): $(CCAN_HEADERS) $(BITCOIN_HEADERS) $(EXTERNAL_HEADERS) $(COMMON_HEADERS_GEN)
+
+# Only common/version.c can include this header.
+common/version.o: gen_version.h
 
 ALL_GEN_HEADERS += $(COMMON_HEADERS_GEN)
 ALL_OBJS += $(COMMON_OBJS)

@@ -380,10 +380,9 @@ static bool handle_get_local_channel_update(struct peer *peer, const u8 *msg)
 		update = gossip_store_get(tmpctx, rstate->gs,
 					  chan->half[local_chan->direction].bcast.index);
 out:
-	status_debug("peer %s schanid %s: %s update",
-		     type_to_string(tmpctx, struct node_id, &peer->id),
-		     type_to_string(tmpctx, struct short_channel_id, &scid),
-		     update ? "got" : "no");
+	status_peer_debug(&peer->id, "schanid %s: %s update",
+			  type_to_string(tmpctx, struct short_channel_id, &scid),
+			  update ? "got" : "no");
 
 	msg = towire_gossipd_get_update_reply(NULL, update);
 	daemon_conn_send(peer->dc, take(msg));
@@ -489,6 +488,9 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 	case WIRE_CHANNEL_REESTABLISH:
 	case WIRE_ANNOUNCEMENT_SIGNATURES:
 	case WIRE_GOSSIP_TIMESTAMP_FILTER:
+#if EXPERIMENTAL_FEATURES
+	case WIRE_ONION_MESSAGE:
+#endif
 		status_broken("peer %s: relayed unexpected msg of type %s",
 			      type_to_string(tmpctx, struct node_id, &peer->id),
 			      wire_type_name(fromwire_peektype(msg)));
@@ -501,7 +503,8 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 		ok = handle_get_local_channel_update(peer, msg);
 		goto handled_cmd;
 	case WIRE_GOSSIPD_LOCAL_ADD_CHANNEL:
-		ok = handle_local_add_channel(peer->daemon->rstate, msg, 0);
+		ok = handle_local_add_channel(peer->daemon->rstate, peer,
+					      msg, 0);
 		goto handled_cmd;
 	case WIRE_GOSSIPD_LOCAL_CHANNEL_UPDATE:
 		ok = handle_local_channel_update(peer->daemon, &peer->id, msg);
@@ -517,10 +520,9 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 	}
 
 	/* Anything else should not have been sent to us: close on it */
-	status_broken("peer %s: unexpected cmd of type %i %s",
-		      type_to_string(tmpctx, struct node_id, &peer->id),
-		      fromwire_peektype(msg),
-		      gossip_peerd_wire_type_name(fromwire_peektype(msg)));
+	status_peer_broken(&peer->id, "unexpected cmd of type %i %s",
+			   fromwire_peektype(msg),
+			   gossip_peerd_wire_type_name(fromwire_peektype(msg)));
 	return io_close(conn);
 
 	/* Commands should always be OK. */
@@ -614,7 +616,8 @@ static struct io_plan *connectd_new_peer(struct io_conn *conn,
 	 *
 	 * A node:
 	 *   - if the `gossip_queries` feature is negotiated:
-	 * 	- MUST NOT relay any gossip messages unless explicitly requested.
+	 * 	- MUST NOT relay any gossip messages it did not generate itself,
+	 *        unless explicitly requested.
 	 */
 	if (peer->gossip_queries_feature) {
 		gs = NULL;
@@ -831,8 +834,8 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 
 	if (!fromwire_gossipctl_init(daemon, msg,
 				     &chainparams,
+				     &daemon->our_features,
 				     &daemon->id,
-				     &daemon->nodefeatures,
 				     daemon->rgb,
 				     daemon->alias,
 				     &daemon->announcable,
@@ -842,9 +845,7 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 		master_badmsg(WIRE_GOSSIPCTL_INIT, msg);
 	}
 
-	daemon->chain_hash = chainparams->genesis_blockhash;
 	daemon->rstate = new_routing_state(daemon,
-					   chainparams_by_chainhash(&daemon->chain_hash),
 					   &daemon->id,
 					   &daemon->peers,
 					   &daemon->timers,
@@ -886,11 +887,13 @@ static struct io_plan *getroute_req(struct io_conn *conn, struct daemon *daemon,
 	struct node_id *source, destination;
 	struct amount_msat msat;
 	u32 final_cltv;
-	u64 riskfactor_by_million;
+	/* risk factor 12.345% -> riskfactor_millionths = 12345000 */
+	u64 riskfactor_millionths;
 	u32 max_hops;
 	u8 *out;
-	struct route_hop *hops;
-	double fuzz;
+	struct route_hop **hops;
+	/* fuzz 12.345% -> fuzz_millionths = 12345000 */
+	u64 fuzz_millionths;
 	struct exclude_entry **excluded;
 
 	/* To choose between variations, we need to know how much we're
@@ -904,12 +907,9 @@ static struct io_plan *getroute_req(struct io_conn *conn, struct daemon *daemon,
 	 * for a route from ourselves (the usual case): in that case,
 	 * we don't have to consider fees on our own outgoing channels.
 	 */
-	if (!fromwire_gossip_getroute_request(msg, msg,
-					      &source, &destination,
-					      &msat, &riskfactor_by_million,
-					      &final_cltv, &fuzz,
-					      &excluded,
-					      &max_hops))
+	if (!fromwire_gossip_getroute_request(
+		msg, msg, &source, &destination, &msat, &riskfactor_millionths,
+		&final_cltv, &fuzz_millionths, &excluded, &max_hops))
 		master_badmsg(WIRE_GOSSIP_GETROUTE_REQUEST, msg);
 
 	status_debug("Trying to find a route from %s to %s for %s",
@@ -919,11 +919,14 @@ static struct io_plan *getroute_req(struct io_conn *conn, struct daemon *daemon,
 		     type_to_string(tmpctx, struct amount_msat, &msat));
 
 	/* routing.c does all the hard work; can return NULL. */
-	hops = get_route(tmpctx, daemon->rstate, source, &destination,
-			 msat, riskfactor_by_million / 1000000.0, final_cltv,
-			 fuzz, pseudorand_u64(), excluded, max_hops);
+	hops = get_route(tmpctx, daemon->rstate, source, &destination, msat,
+			 riskfactor_millionths / 1000000.0, final_cltv,
+			 fuzz_millionths / 1000000.0, pseudorand_u64(),
+			 excluded, max_hops);
 
-	out = towire_gossip_getroute_reply(NULL, hops);
+	out = towire_gossip_getroute_reply(NULL,
+					   cast_const2(const struct route_hop **,
+						       hops));
 	daemon_conn_send(daemon->master, take(out));
 	return daemon_conn_read_next(conn, daemon->master);
 }
@@ -963,6 +966,41 @@ static struct gossip_halfchannel_entry *hc_entry(const tal_t *ctx,
 	return e;
 }
 
+/*~ We don't keep channel features in memory; they're rarely used.  So we
+ * remember if it exists, and load it off disk when needed. */
+static u8 *get_channel_features(const tal_t *ctx,
+				struct gossip_store *gs,
+				const struct chan *chan)
+{
+	secp256k1_ecdsa_signature sig;
+	u8 *features;
+	struct bitcoin_blkid chain_hash;
+	struct short_channel_id short_channel_id;
+	struct node_id node_id;
+	struct pubkey bitcoin_key;
+	struct amount_sat sats;
+	const u8 *ann;
+
+	/* This is where we stash a flag to indicate it exists. */
+	if (!chan->half[0].any_features)
+		return NULL;
+
+	/* Could be a channel_announcement, could be a local_add_channel */
+	ann = gossip_store_get(tmpctx, gs, chan->bcast.index);
+	if (!fromwire_channel_announcement(ctx, ann, &sig, &sig, &sig, &sig,
+					   &features, &chain_hash,
+					   &short_channel_id,
+					   &node_id, &node_id,
+					   &bitcoin_key, &bitcoin_key)
+	    && !fromwire_gossipd_local_add_channel(ctx, ann, &short_channel_id,
+						   &node_id, &sats, &features))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "bad channel_announcement / local_add_channel at %u: %s",
+			      chan->bcast.index, tal_hex(tmpctx, ann));
+
+	return features;
+}
+
 /*~ Marshal (possibly) both channel directions into entries. */
 static void append_channel(struct routing_state *rstate,
 			   const struct gossip_getchannels_entry ***entries,
@@ -977,6 +1015,7 @@ static void append_channel(struct routing_state *rstate,
 	e->local_disabled = is_chan_local_disabled(rstate, chan);
 	e->public = is_chan_public(chan);
 	e->short_channel_id = chan->scid;
+	e->features = get_channel_features(e, rstate->gs, chan);
 	if (!srcfilter || node_id_eq(&e->node[0], srcfilter))
 		e->e[0] = hc_entry(*entries, chan, 0);
 	else
@@ -1149,8 +1188,8 @@ static struct io_plan *ping_req(struct io_conn *conn, struct daemon *daemon,
 		status_failed(STATUS_FAIL_MASTER_IO, "Oversize ping");
 
 	queue_peer_msg(peer, take(ping));
-	status_debug("sending ping expecting %sresponse",
-		     num_pong_bytes >= 65532 ? "no " : "");
+	status_peer_debug(&peer->id, "sending ping expecting %sresponse",
+			  num_pong_bytes >= 65532 ? "no " : "");
 
 	/* BOLT #1:
 	 *
@@ -1191,18 +1230,6 @@ static bool node_has_public_channels(const struct node *peer,
 	return false;
 }
 
-/*~ The `exposeprivate` flag is a trinary: NULL == dynamic, otherwise
- * value decides.  Thus, we provide two wrappers for clarity: */
-static bool never_expose(bool *exposeprivate)
-{
-	return exposeprivate && !*exposeprivate;
-}
-
-static bool always_expose(bool *exposeprivate)
-{
-	return exposeprivate && *exposeprivate;
-}
-
 /*~ For routeboost, we offer payers a hint of what incoming channels might
  * have capacity for their payment.  To do this, lightningd asks for the
  * information about all channels to this node; but gossipd doesn't know about
@@ -1214,13 +1241,11 @@ static struct io_plan *get_incoming_channels(struct io_conn *conn,
 	struct node *node;
 	struct route_info *public = tal_arr(tmpctx, struct route_info, 0);
 	struct route_info *private = tal_arr(tmpctx, struct route_info, 0);
-	bool has_public;
-	bool *exposeprivate;
+	bool *priv_deadends = tal_arr(tmpctx, bool, 0);
+	bool *pub_deadends = tal_arr(tmpctx, bool, 0);
 
-	if (!fromwire_gossip_get_incoming_channels(tmpctx, msg, &exposeprivate))
+	if (!fromwire_gossip_get_incoming_channels(msg))
 		master_badmsg(WIRE_GOSSIP_GET_INCOMING_CHANNELS, msg);
-
-	has_public = always_expose(exposeprivate);
 
 	node = get_node(daemon->rstate, &daemon->rstate->local_id);
 	if (node) {
@@ -1230,6 +1255,7 @@ static struct io_plan *get_incoming_channels(struct io_conn *conn,
 		for (c = first_chan(node, &i); c; c = next_chan(node, &i)) {
 			const struct half_chan *hc;
 			struct route_info ri;
+			bool deadend;
 
 			hc = &c->half[half_chan_to(node, c)];
 
@@ -1242,25 +1268,21 @@ static struct io_plan *get_incoming_channels(struct io_conn *conn,
 			ri.fee_proportional_millionths = hc->proportional_fee;
 			ri.cltv_expiry_delta = hc->delay;
 
-			has_public |= is_chan_public(c);
-
-			/* If peer doesn't have other public channels,
-			 * no point giving route */
-			if (!node_has_public_channels(other_node(node, c), c))
-				continue;
-
-			if (always_expose(exposeprivate) || is_chan_public(c))
+			deadend = !node_has_public_channels(other_node(node, c),
+							    c);
+			if (is_chan_public(c)) {
 				tal_arr_expand(&public, ri);
-			else
+				tal_arr_expand(&pub_deadends, deadend);
+			} else {
 				tal_arr_expand(&private, ri);
+				tal_arr_expand(&priv_deadends, deadend);
+			}
 		}
 	}
 
-	/* If no public channels (even deadend ones!), share private ones. */
-	if (!has_public && !never_expose(exposeprivate))
-		msg = towire_gossip_get_incoming_channels_reply(NULL, private);
-	else
-		msg = towire_gossip_get_incoming_channels_reply(NULL, public);
+	msg = towire_gossip_get_incoming_channels_reply(NULL,
+							public, pub_deadends,
+							private, priv_deadends);
 	daemon_conn_send(daemon->master, take(msg));
 
 	return daemon_conn_read_next(conn, daemon->master);
@@ -1355,27 +1377,43 @@ static struct io_plan *dev_gossip_set_time(struct io_conn *conn,
 }
 #endif /* DEVELOPER */
 
-/*~ lightningd: so, tell me about this channel, so we can forward to it. */
-static struct io_plan *get_channel_peer(struct io_conn *conn,
-					struct daemon *daemon, const u8 *msg)
+/*~ lightningd: so, get me the latest update for this local channel,
+ *  so I can include it in an error message. */
+static struct io_plan *get_stripped_cupdate(struct io_conn *conn,
+					    struct daemon *daemon, const u8 *msg)
 {
 	struct short_channel_id scid;
 	struct local_chan *local_chan;
-	const struct node_id *key;
+	const u8 *stripped_update;
 
-	if (!fromwire_gossip_get_channel_peer(msg, &scid))
-		master_badmsg(WIRE_GOSSIP_GET_CHANNEL_PEER, msg);
+	if (!fromwire_gossip_get_stripped_cupdate(msg, &scid))
+		master_badmsg(WIRE_GOSSIP_GET_STRIPPED_CUPDATE, msg);
 
 	local_chan = local_chan_map_get(&daemon->rstate->local_chan_map, &scid);
 	if (!local_chan) {
 		status_debug("Failed to resolve local channel %s",
 			     type_to_string(tmpctx, struct short_channel_id, &scid));
-		key = NULL;
+		stripped_update = NULL;
 	} else {
-		key = &local_chan->chan->nodes[!local_chan->direction]->id;
+		const struct half_chan *hc;
+
+		/* Since we're going to use it, make sure it's up-to-date. */
+		refresh_local_channel(daemon, local_chan, false);
+
+		hc = &local_chan->chan->half[local_chan->direction];
+		if (is_halfchan_defined(hc)) {
+			const u8 *update;
+
+			update = gossip_store_get(tmpctx, daemon->rstate->gs,
+						  hc->bcast.index);
+			stripped_update = tal_dup_arr(tmpctx, u8, update + 2,
+						      tal_count(update) - 2, 0);
+		} else
+			stripped_update = NULL;
 	}
 	daemon_conn_send(daemon->master,
-			 take(towire_gossip_get_channel_peer_reply(NULL, key)));
+			 take(towire_gossip_get_stripped_cupdate_reply(NULL,
+							   stripped_update)));
 	return daemon_conn_read_next(conn, daemon->master);
 }
 
@@ -1423,8 +1461,7 @@ static u8 *patch_channel_update(const tal_t *ctx, u8 *channel_update TAKES)
 			tal_free(channel_update);
 		return fixed;
 	} else {
-		return tal_dup_arr(ctx, u8,
-				   channel_update, tal_count(channel_update), 0);
+		return tal_dup_talarr(ctx, u8, channel_update);
 	}
 }
 
@@ -1469,32 +1506,26 @@ static struct io_plan *handle_payment_failure(struct io_conn *conn,
 					      struct daemon *daemon,
 					      const u8 *msg)
 {
-	struct node_id erring_node;
-	struct short_channel_id erring_channel;
-	u8 erring_channel_direction;
 	u8 *error;
-	enum onion_type failcode;
 	u8 *channel_update;
 
-	if (!fromwire_gossip_payment_failure(msg, msg,
-					     &erring_node,
-					     &erring_channel,
-					     &erring_channel_direction,
-					     &error))
+	if (!fromwire_gossip_payment_failure(msg, msg, &error))
 		master_badmsg(WIRE_GOSSIP_PAYMENT_FAILURE, msg);
 
-	failcode = fromwire_peektype(error);
 	channel_update = channel_update_from_onion_error(tmpctx, error);
-	if (channel_update)
+	if (channel_update) {
 		status_debug("Extracted channel_update %s from onionreply %s",
 			     tal_hex(tmpctx, channel_update),
 			     tal_hex(tmpctx, error));
-	routing_failure(daemon->rstate,
-			&erring_node,
-			&erring_channel,
-			erring_channel_direction,
-			failcode,
-			channel_update);
+		u8 *err = handle_channel_update(daemon->rstate, channel_update,
+						NULL, NULL);
+		if (err) {
+			status_info("extracted bad channel_update %s from onionreply %s",
+				    sanitize_error(err, err, NULL),
+				    error);
+			tal_free(err);
+		}
+	}
 
 	return daemon_conn_read_next(conn, daemon->master);
 }
@@ -1574,8 +1605,8 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIP_GETCHANNELS_REQUEST:
 		return getchannels_req(conn, daemon, msg);
 
-	case WIRE_GOSSIP_GET_CHANNEL_PEER:
-		return get_channel_peer(conn, daemon, msg);
+	case WIRE_GOSSIP_GET_STRIPPED_CUPDATE:
+		return get_stripped_cupdate(conn, daemon, msg);
 
 	case WIRE_GOSSIP_GET_TXOUT_REPLY:
 		return handle_txout_reply(conn, daemon, msg);
@@ -1623,7 +1654,7 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIP_GETROUTE_REPLY:
 	case WIRE_GOSSIP_GETCHANNELS_REPLY:
 	case WIRE_GOSSIP_PING_REPLY:
-	case WIRE_GOSSIP_GET_CHANNEL_PEER_REPLY:
+	case WIRE_GOSSIP_GET_STRIPPED_CUPDATE_REPLY:
 	case WIRE_GOSSIP_GET_INCOMING_CHANNELS_REPLY:
 	case WIRE_GOSSIP_GET_TXOUT:
 	case WIRE_GOSSIP_DEV_MEMLEAK_REPLY:

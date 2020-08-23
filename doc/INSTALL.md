@@ -10,7 +10,8 @@ Install
 7. [Android](#to-cross-compile-for-android)
 8. [Raspberry Pi](#to-cross-compile-for-raspberry-pi)
 9. [Armbian](#to-compile-for-armbian)
-10. [Additional steps](#additional-steps)
+10. [Alpine](#to-compile-for-alpine)
+11. [Additional steps](#additional-steps)
 
 Library Requirements
 --------------------
@@ -24,7 +25,7 @@ For actually doing development and running the tests, you will also need:
 * pip3: to install python-bitcoinlib
 * valgrind: for extra debugging checks
 
-You will also need a version of bitcoind with segregated witness and `estimatesmartfee` economical node, such as the 0.16 or above.
+You will also need a version of bitcoind with segregated witness and `estimatesmartfee` with `ECONOMICAL` mode support, such as the 0.16 or above.
 
 To Build on Ubuntu
 ---------------------
@@ -36,16 +37,17 @@ Get dependencies:
     sudo apt-get update
     sudo apt-get install -y \
       autoconf automake build-essential git libtool libgmp-dev \
-      libsqlite3-dev python python3 python3-mako net-tools zlib1g-dev libsodium-dev \
-      git gettext
+      libsqlite3-dev python3 python3-mako net-tools zlib1g-dev libsodium-dev \
+      gettext
 
 If you don't have Bitcoin installed locally you'll need to install that
-as well:
+as well. It's now available via [snapd](https://snapcraft.io/bitcoin-core).
 
-    sudo apt-get install software-properties-common
-    sudo add-apt-repository ppa:bitcoin/bitcoin
-    sudo apt-get update
-    sudo apt-get install -y bitcoind
+    sudo apt-get install snapd
+    sudo snap install bitcoin-core
+    # Snap does some weird things with binary names; you'll
+    # want to add a link to them so everything works as expected
+    sudo ln -s /snap/bitcoin-core/current/bin/bitcoin{d,-cli} /usr/local/bin/
 
 Clone lightning:
 
@@ -55,7 +57,7 @@ Clone lightning:
 For development or running tests, get additional dependencies:
 
     sudo apt-get install -y valgrind python3-pip libpq-dev
-    sudo pip3 install -r tests/requirements.txt -r doc/requirements.txt
+    sudo pip3 install -r requirements.txt
 
 Build lightning:
 
@@ -88,7 +90,6 @@ $ sudo dnf update -y && \
                 git \
                 gmp-devel \
                 libsq3-devel \
-                python2-devel \
                 python3-devel \
                 python3-pip \
                 python3-setuptools \
@@ -128,40 +129,42 @@ $ lightningd --network=testnet
 ```
 
 To Build on FreeBSD
----------------------
+-------------------
 
 OS version: FreeBSD 11.1-RELEASE or above
 
-Get dependencies:
+c-lightning is in the FreeBSD ports, so install it as any other port
+(dependencies are handled automatically):
 
-    # pkg install -y \
-      autoconf automake gettext git gmp gmake libtool python python3 sqlite3 libsodium py36-mako bash
+    # pkg install c-lightning
 
-If you don't have Bitcoin installed locally you'll need to install that
-as well:
+for a binary, pre-compiled package. If you want to compile locally and
+fiddle with compile time options:
 
-    # pkg install -y bitcoin-daemon bitcoin-utils
+    # cd /usr/ports/net-p2p/c-lightning && make install
 
-Clone lightning:
+mrkd is required to build man pages from markdown files (not done by the port):
 
-    $ git clone https://github.com/ElementsProject/lightning.git
-    $ cd lightning
+    # cd /usr/ports/devel/py-pip && make install
+    $ pip install --user mrkd
 
-Build lightning:
+See `/usr/ports/net-p2p/c-lightning/Makefile` for instructions on how to
+build from an arbitrary git commit, instead of the latest release tag.
 
-    $ ./configure
-    $ gmake
-    $ gmake install
+**Note**: Make sure you've set an utf-8 locale, e.g. 
+`export LC_CTYPE=en_US.UTF-8`, otherwise manpage installation may fail.
 
 Running lightning:
 
-**Note**: Edit your `/usr/local/etc/bitcoin.conf` to include
-`rpcuser=<foo>` and `rpcpassword=<bar>` first, you may also need to
-include `testnet=1`
+Configure bitcoind, if not already: add `rpcuser=<foo>` and `rpcpassword=<bar>`
+to `/usr/local/etc/bitcoin.conf`, maybe also `testnet=1`.
+
+Configure lightningd: copy `/usr/local/etc/lightningd-bitcoin.conf.sample` to
+`/usr/local/etc/lightningd-bitcoin.conf` and edit according to your needs.
 
     # service bitcoind start
-    $ ./lightningd/lightningd &
-    $ ./cli/lightning-cli help
+    # service lightningd start
+    # lightning-cli --rpc-file /var/db/c-lightning/bitcoin/lightning-rpc --lightning-dir=/var/db/c-lightning help
 
 To Build on NixOS
 --------------------
@@ -179,7 +182,7 @@ To Build on macOS
 
 Assuming you have Xcode and Homebrew installed. Install dependencies:
 
-    $ brew install autoconf automake libtool python3 gmp gnu-sed gettext
+    $ brew install autoconf automake libtool python3 gmp gnu-sed gettext libsodium
     $ ln -s /usr/local/Cellar/gettext/0.20.1/bin/xgettext /usr/local/opt
     $ export PATH="/usr/local/opt:$PATH"
 
@@ -200,7 +203,7 @@ If you need Python 3.x for mako (or get a mako build error):
 If you don't have bitcoind installed locally you'll need to install that
 as well:
 
-    $ brew install berkeley-db4 boost miniupnpc openssl pkg-config libevent libsodium
+    $ brew install berkeley-db4 boost miniupnpc pkg-config libevent
     $ git clone https://github.com/bitcoin/bitcoin
     $ cd bitcoin
     $ ./autogen.sh
@@ -335,6 +338,33 @@ You can compile in `customize-image.sh` using the instructions for Ubuntu.
 
 A working example that compiles both bitcoind and c-lightning for Armbian can
 be found [here](https://github.com/Sjors/armbian-bitcoin-core).
+
+To compile for Alpine
+---------------------
+Get dependencies:
+```
+apk update
+apk add ca-certificates alpine-sdk autoconf automake git libtool \
+  gmp-dev sqlite-dev python python3 py3-mako net-tools zlib-dev libsodium gettext
+```
+Clone lightning:
+```
+git clone https://github.com/ElementsProject/lightning.git
+cd lightning
+git submodule update --init
+```
+Build and install:
+```
+./configure
+make
+make install
+```
+Clean up:
+```
+cd .. && rm -rf lightning
+apk del ca-certificates alpine-sdk autoconf automake git libtool \
+  gmp-dev sqlite python3 py3-mako net-tools zlib-dev libsodium gettext
+```
 
 Additional steps
 --------------------

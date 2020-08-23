@@ -1,13 +1,13 @@
 #include <common/cryptomsg.h>
+#include <common/features.h>
 #include <common/wireaddr.h>
 #include <wire/gen_onion_wire.h>
 
 # Initialize the gossip daemon.
 msgtype,gossipctl_init,3000
 msgdata,gossipctl_init,chainparams,chainparams,
+msgdata,gossipctl_init,our_features,feature_set,
 msgdata,gossipctl_init,id,node_id,
-msgdata,gossipctl_init,gflen,u16,
-msgdata,gossipctl_init,globalfeatures,u8,gflen
 msgdata,gossipctl_init,rgb,u8,3
 msgdata,gossipctl_init,alias,u8,32
 msgdata,gossipctl_init,num_announcable,u16,
@@ -35,10 +35,9 @@ msgtype,gossip_getroute_request,3006
 msgdata,gossip_getroute_request,source,?node_id,
 msgdata,gossip_getroute_request,destination,node_id,
 msgdata,gossip_getroute_request,msatoshi,amount_msat,
-# We don't pass doubles, so pass riskfactor  1000000.
-msgdata,gossip_getroute_request,riskfactor_by_million,u64,
+msgdata,gossip_getroute_request,riskfactor_millionths,u64,
 msgdata,gossip_getroute_request,final_cltv,u32,
-msgdata,gossip_getroute_request,fuzz,double,
+msgdata,gossip_getroute_request,fuzz_millionths,u64,
 msgdata,gossip_getroute_request,num_excluded,u16,
 msgdata,gossip_getroute_request,excluded,exclude_entry,num_excluded
 msgdata,gossip_getroute_request,max_hops,u32,
@@ -74,12 +73,13 @@ msgdata,gossip_ping_reply,totlen,u16,
 msgtype,gossip_dev_set_max_scids_encode_size,3030
 msgdata,gossip_dev_set_max_scids_encode_size,max,u32,
 
-# Given a short_channel_id, return the other endpoint (or none if DNE)
-msgtype,gossip_get_channel_peer,3009
-msgdata,gossip_get_channel_peer,channel_id,short_channel_id,
+# Given a short_channel_id, return the latest (stripped) update for error msg.
+msgtype,gossip_get_stripped_cupdate,3010
+msgdata,gossip_get_stripped_cupdate,channel_id,short_channel_id,
 
-msgtype,gossip_get_channel_peer_reply,3109
-msgdata,gossip_get_channel_peer_reply,peer_id,?node_id,
+msgtype,gossip_get_stripped_cupdate_reply,3110
+msgdata,gossip_get_stripped_cupdate_reply,stripped_update_len,u16,
+msgdata,gossip_get_stripped_cupdate_reply,stripped_update,u8,stripped_update_len
 
 # gossipd->master: we're closing this channel.
 msgtype,gossip_local_channel_close,3027
@@ -98,9 +98,6 @@ msgdata,gossip_get_txout_reply,outscript,u8,len
 
 # master->gossipd an htlc failed with this onion error.
 msgtype,gossip_payment_failure,3021
-msgdata,gossip_payment_failure,erring_node,node_id,
-msgdata,gossip_payment_failure,erring_channel,short_channel_id,
-msgdata,gossip_payment_failure,erring_channel_direction,u8,
 msgdata,gossip_payment_failure,len,u16,
 msgdata,gossip_payment_failure,error,u8,len
 
@@ -128,12 +125,15 @@ msgdata,gossip_dev_compact_store_reply,success,bool,
 
 # master -> gossipd: get route_info for our incoming channels
 msgtype,gossip_get_incoming_channels,3025
-msgdata,gossip_get_incoming_channels,private_too,?bool,
 
 # gossipd -> master: here they are.
 msgtype,gossip_get_incoming_channels_reply,3125
-msgdata,gossip_get_incoming_channels_reply,num,u16,
-msgdata,gossip_get_incoming_channels_reply,route_info,route_info,num
+msgdata,gossip_get_incoming_channels_reply,num_public,u16,
+msgdata,gossip_get_incoming_channels_reply,public_route_info,route_info,num_public
+msgdata,gossip_get_incoming_channels_reply,public_deadends,bool,num_public
+msgdata,gossip_get_incoming_channels_reply,num_private,u16,
+msgdata,gossip_get_incoming_channels_reply,private_route_info,route_info,num_private
+msgdata,gossip_get_incoming_channels_reply,private_deadends,bool,num_private
 
 # master -> gossipd: blockheight increased.
 msgtype,gossip_new_blockheight,3026

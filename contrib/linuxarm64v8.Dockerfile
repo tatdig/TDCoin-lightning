@@ -10,7 +10,7 @@ FROM debian:stretch-slim as downloader
 RUN set -ex \
 	&& apt-get update \
 	&& apt-get install -qq --no-install-recommends ca-certificates dirmngr wget \
-     qemu qemu-user-static qemu-user binfmt-support
+     qemu-user-static binfmt-support
 
 WORKDIR /opt
 
@@ -18,7 +18,7 @@ RUN wget -qO /opt/tini "https://github.com/krallin/tini/releases/download/v0.18.
     && echo "7c5463f55393985ee22357d976758aaaecd08defb3c5294d353732018169b019 /opt/tini" | sha256sum -c - \
     && chmod +x /opt/tini
 
-ARG BITCOIN_VERSION=0.17.0
+ARG BITCOIN_VERSION=0.18.1
 ENV BITCOIN_TARBALL bitcoin-$BITCOIN_VERSION-aarch64-linux-gnu.tar.gz
 ENV BITCOIN_URL https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION/$BITCOIN_TARBALL
 ENV BITCOIN_ASC_URL https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION/SHA256SUMS.asc
@@ -48,7 +48,7 @@ RUN mkdir /opt/litecoin && cd /opt/litecoin \
 FROM debian:stretch-slim as builder
 
 ENV LIGHTNINGD_VERSION=master
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates autoconf automake build-essential gettext git libtool python python3 python3-mako wget gnupg dirmngr git \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates autoconf automake build-essential gettext git libtool python3 python3-mako wget gnupg dirmngr git \
   libc6-arm64-cross gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
 ENV target_host=aarch64-linux-gnu

@@ -2,7 +2,7 @@
 """Simple plugin to allow testing while closing of HTLC is delayed.
 """
 
-from lightning import Plugin
+from pyln.client import Plugin
 import time
 
 plugin = Plugin()
@@ -11,7 +11,7 @@ plugin = Plugin()
 @plugin.hook('invoice_payment')
 def on_payment(payment, plugin, **kwargs):
     time.sleep(float(plugin.get_option('holdtime')))
-    return {}
+    return {'result': 'continue'}
 
 
 plugin.add_option('holdtime', '10', 'The time to hold invoice for.')

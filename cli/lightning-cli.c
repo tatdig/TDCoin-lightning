@@ -9,6 +9,7 @@
 #include <ccan/opt/opt.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/str/str.h>
+#include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <common/configdir.h>
 #include <common/json.h>
@@ -28,25 +29,6 @@
 #define ERROR_FROM_LIGHTNINGD 1
 #define ERROR_TALKING_TO_LIGHTNINGD 2
 #define ERROR_USAGE 3
-
-/* Tal wrappers for opt. */
-static void *opt_allocfn(size_t size)
-{
-	return tal_arr_label(NULL, char, size, TAL_LABEL("opt_allocfn", ""));
-}
-
-static void *tal_reallocfn(void *ptr, size_t size)
-{
-	if (!ptr)
-		return opt_allocfn(size);
-	tal_resize_(&ptr, 1, size, false);
-	return ptr;
-}
-
-static void tal_freefn(void *ptr)
-{
-	tal_free(ptr);
-}
 
 struct netaddr;
 
@@ -88,6 +70,49 @@ static size_t human_readable(const char *buffer, const jsmntok_t *t, char term)
 		for (i = 0; i < t->size; i++) {
 			n += human_readable(buffer, t + n, '=');
 			n += human_readable(buffer, t + n, '\n');
+		}
+		return n;
+	case JSMN_UNDEFINED:
+		break;
+	}
+	abort();
+}
+
+/* Returns number of tokens digested */
+static size_t flat_json(const char *prefix,
+			const char *buffer, const jsmntok_t *t)
+{
+	size_t i, n;
+	char *p;
+
+	switch (t->type) {
+	case JSMN_PRIMITIVE:
+	case JSMN_STRING:
+		printf("%s=%.*s\n",
+		       prefix, t->end - t->start, buffer + t->start);
+		return 1;
+	case JSMN_ARRAY:
+		n = 1;
+		for (i = 0; i < t->size; i++) {
+			p = tal_fmt(NULL, "%s[%zi]", prefix, i);
+			n += flat_json(p, buffer, t + n);
+			tal_free(p);
+		}
+		return n;
+	case JSMN_OBJECT:
+		n = 1;
+		for (i = 0; i < t->size; i++) {
+			if (streq(prefix, ""))
+				p = tal_fmt(NULL, "%.*s",
+					    t[n].end - t[n].start,
+					    buffer + t[n].start);
+			else
+				p = tal_fmt(NULL, "%s.%.*s", prefix,
+					    t[n].end - t[n].start,
+					    buffer + t[n].start);
+			n++;
+			n += flat_json(p, buffer, t + n);
+			tal_free(p);
 		}
 		return n;
 	case JSMN_UNDEFINED:
@@ -202,6 +227,7 @@ enum format {
 	JSON,
 	HUMAN,
 	HELPLIST,
+	FLAT,
 	DEFAULT_FORMAT,
 	RAW
 };
@@ -209,6 +235,12 @@ enum format {
 static char *opt_set_human(enum format *format)
 {
 	*format = HUMAN;
+	return NULL;
+}
+
+static char *opt_set_flat(enum format *format)
+{
+	*format = FLAT;
 	return NULL;
 }
 
@@ -393,12 +425,14 @@ static void tal_error(const char *msg)
 	abort();
 }
 
-static enum format delete_format_hint(const char *resp,
-				      jsmntok_t **toks,
-				      jsmntok_t *result)
+static enum format delete_format_hint(const char *resp, jsmntok_t **toks)
 {
+	const jsmntok_t *result = json_get_member(resp, *toks, "result");
 	const jsmntok_t *hint;
 	enum format format = JSON;
+
+	if (!result)
+		return format;
 
 	hint = json_get_member(resp, result, "format-hint");
 	if (!hint)
@@ -408,7 +442,8 @@ static enum format delete_format_hint(const char *resp,
 		format = HUMAN;
 
 	/* Don't let hint appear in the output! */
-	json_tok_remove(toks, result, hint-1, 1);
+        /* Note the aritmetic on *toks for const-washing */
+	json_tok_remove(toks, *toks + (result - *toks), hint-1, 1);
 	return format;
 }
 
@@ -419,22 +454,19 @@ static enum format choose_format(const char *resp,
 				 enum format format)
 {
 	/* If they specify a format, that's what we use. */
-	if (format != DEFAULT_FORMAT)
+	if (format != DEFAULT_FORMAT) {
+		/* But humans don't want to see the format hint! */
+		if (format == HUMAN)
+			delete_format_hint(resp, toks);
 		return format;
+	}
 
 	/* This works best when we order it. */
 	if (streq(method, "help") && command == NULL)
 		format = HELPLIST;
-	else {
-		const jsmntok_t *result = json_get_member(resp, *toks, "result");
-		if (result)
-			/* Use offset of result to get non-const ptr */
-			format = delete_format_hint(resp, toks,
-						    /* const-washing */
-						    *toks + (result - *toks));
-		else
-			format = JSON;
-	}
+	else
+		format = delete_format_hint(resp, toks);
+
 	return format;
 }
 
@@ -450,8 +482,7 @@ int main(int argc, char *argv[])
 	jsmntok_t *toks;
 	const jsmntok_t *result, *error, *id;
 	const tal_t *ctx = tal(NULL, char);
-	char *lightning_dir = default_configdir(ctx);
-	char *rpc_filename = default_rpcfile(ctx);
+	char *config_filename, *lightning_dir, *net_dir, *rpc_filename;
 	jsmn_parser parser;
 	int parserr;
 	enum format format = DEFAULT_FORMAT;
@@ -462,20 +493,19 @@ int main(int argc, char *argv[])
 	jsmn_init(&parser);
 
 	tal_set_backend(NULL, NULL, NULL, tal_error);
-	opt_set_alloc(opt_allocfn, tal_reallocfn, tal_freefn);
 
-	opt_register_arg("--lightning-dir=<dir>", opt_set_talstr, opt_show_charp,
-			 &lightning_dir,
-			 "Set working directory. All other files are relative to this");
+	setup_option_allocators();
 
-	opt_register_arg("--rpc-file", opt_set_talstr, opt_show_charp,
-			 &rpc_filename,
-			 "Set JSON-RPC socket (or /dev/tty)");
+	initial_config_opts(ctx, argc, argv,
+			    &config_filename, &lightning_dir, &net_dir,
+			    &rpc_filename);
 
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
 			   "<command> [<params>...]", "Show this message. Use the command help (without hyphens -- \"lightning-cli help\") to get a list of all RPC commands");
 	opt_register_noarg("-H|--human-readable", opt_set_human, &format,
-			   "Human-readable output (default for 'help')");
+			   "Human-readable output");
+	opt_register_noarg("-F|--flat", opt_set_flat, &format,
+			   "Flatten output ('x.y.x=' format)");
 	opt_register_noarg("-J|--json", opt_set_json, &format,
 			   "JSON output (default unless 'help')");
 	opt_register_noarg("-R|--raw", opt_set_raw, &format,
@@ -515,9 +545,16 @@ int main(int argc, char *argv[])
 		tal_free(page);
 	}
 
-	if (chdir(lightning_dir) != 0)
+	/* If an absolute path to the RPC socket is given, it takes over other
+	 * configuration options. */
+	if (path_is_abs(rpc_filename)) {
+		net_dir = path_dirname(ctx, rpc_filename);
+		rpc_filename = path_basename(ctx, rpc_filename);
+	}
+
+	if (chdir(net_dir) != 0)
 		err(ERROR_TALKING_TO_LIGHTNINGD, "Moving into '%s'",
-		    lightning_dir);
+		    net_dir);
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (strlen(rpc_filename) + 1 > sizeof(addr.sun_path))
@@ -639,6 +676,9 @@ int main(int argc, char *argv[])
 		case HUMAN:
 			human_readable(resp, result, '\n');
 			break;
+		case FLAT:
+			flat_json("", resp, result);
+			break;
 		case JSON:
 			print_json(resp, result, "");
 			printf("\n");
@@ -651,8 +691,6 @@ int main(int argc, char *argv[])
 		default:
 			abort();
 		}
-		tal_free(lightning_dir);
-		tal_free(rpc_filename);
 		tal_free(ctx);
 		opt_free_table();
 		return 0;
@@ -665,8 +703,6 @@ int main(int argc, char *argv[])
 		print_json(resp, error, "");
 		printf("\n");
 	}
-	tal_free(lightning_dir);
-	tal_free(rpc_filename);
 	tal_free(ctx);
 	opt_free_table();
 	return 1;

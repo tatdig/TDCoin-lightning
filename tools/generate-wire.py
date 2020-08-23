@@ -172,6 +172,12 @@ class FieldSet(object):
     def needs_context(self):
         return any([field.needs_context() or field.is_optional for field in self.fields.values()])
 
+    def singleton(self):
+        """Return the single message, if there's only one, otherwise None"""
+        if len(self.fields) == 1:
+            return next(iter(self.fields.values()))
+        return None
+
 
 class Type(FieldSet):
     assignables = [
@@ -185,6 +191,7 @@ class Type(FieldSet):
         'bool',
         'amount_sat',
         'amount_msat',
+        'errcode_t',
         'bigsize',
         'varint'
     ]
@@ -198,7 +205,7 @@ class Type(FieldSet):
         'secp256k1_ecdsa_signature',
         'secp256k1_ecdsa_recoverable_signature',
         'wirestring',
-        'double',
+        'errcode_t',
         'bigsize',
         'varint',
     ]
@@ -215,12 +222,20 @@ class Type(FieldSet):
         'gossip_getnodes_entry',
         'gossip_getchannels_entry',
         'failed_htlc',
+        'existing_htlc',
         'utxo',
         'bitcoin_tx',
         'wirestring',
         'per_peer_state',
         'bitcoin_tx_output',
         'exclude_entry',
+        'fee_states',
+        'onionreply',
+        'feature_set',
+        'onionmsg_path',
+        'route_hop',
+        'tx_parts',
+        'wally_psbt',
     ]
 
     # Some BOLT types are re-typed based on their field name
@@ -472,8 +487,14 @@ class Master(object):
                     unsorted.remove(s)
         return sorted_types
 
-    def tlv_messages(self):
-        return [m for tlv in self.tlvs.values() for m in tlv.messages.values()]
+    def tlv_structs(self):
+        ret = []
+        for tlv in self.tlvs.values():
+            for v in tlv.messages.values():
+                if not v.singleton():
+                    ret.append(v)
+
+        return ret
 
     def find_template(self, options):
         dirpath = os.path.dirname(os.path.abspath(__file__))
@@ -492,10 +513,11 @@ class Master(object):
     def write(self, options, output):
         template = self.find_template(options)
         enum_sets = []
-        enum_sets.append({
-            'name': options.enum_name,
-            'set': self.messages.values(),
-        })
+        if len(self.messages.values()) != 0:
+            enum_sets.append({
+                'name': options.enum_name,
+                'set': self.messages.values(),
+            })
         stuff = {}
         stuff['top_comments'] = self.top_comments
         stuff['options'] = options
@@ -504,7 +526,7 @@ class Master(object):
         stuff['includes'] = self.inclusions
         stuff['enum_sets'] = enum_sets
         subtypes = self.get_ordered_subtypes()
-        stuff['structs'] = subtypes + self.tlv_messages()
+        stuff['structs'] = subtypes + self.tlv_structs()
         stuff['tlvs'] = self.tlvs
 
         # We leave out extension messages in the printing pages. Any extension
@@ -526,6 +548,9 @@ def main(options, args=None, output=sys.stdout, lines=None):
 
     # Create a new 'master' that serves as the coordinator for the file generation
     master = Master()
+    for i in options.include:
+        master.add_include('#include <{}>'.format(i))
+
     try:
         while True:
             ln, line = next(genline)
@@ -668,6 +693,7 @@ if __name__ == "__main__":
                         action="store_true", default=False)
     parser.add_argument("--page", choices=['header', 'impl'], help="page to print")
     parser.add_argument('--expose-tlv-type', action='append', default=[])
+    parser.add_argument('--include', action='append', default=[])
     parser.add_argument('header_filename', help='The filename of the header')
     parser.add_argument('enum_name', help='The name of the enum to produce')
     parser.add_argument("files", help='Files to read in (or stdin)', nargs=REMAINDER)

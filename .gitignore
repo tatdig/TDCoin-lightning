@@ -11,6 +11,7 @@
 *.po
 *.pyc
 .cppcheck-suppress
+.mypy_cache
 TAGS
 tags
 ccan/tools/configurator/configurator
@@ -18,6 +19,8 @@ ccan/ccan/cdump/tools/cdump-enumstr
 gen_*
 cli/lightning-cli
 tools/check-bolt
+tools/hsmtool
+tools/lightning-hsmtool
 coverage
 ccan/config.h
 __pycache__
@@ -29,9 +32,12 @@ config.vars
 external/libbacktrace-build/
 external/libbacktrace.a
 external/libbacktrace.la
+external/libbase58/
+external/libbase58.a
 test/test_protocol
 test/test_sphinx
 tests/.pytest.restart
+tests/plugins/test_libplugin
 gossip_store
 .pytest_cache
 tools/headerversions
@@ -42,4 +48,5 @@ contrib/pylightning/pylightning.egg-info/
 contrib/pyln-*/build/
 contrib/pyln-*/dist/
 contrib/pyln-*/pyln_*.egg-info/
-release
+plugins/keysend
+release/

@@ -5,6 +5,7 @@
 
 #include <bitcoin/pubkey.h>
 #include <bitcoin/shadouble.h>
+#include <bitcoin/tx.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 #include <common/amount.h>
@@ -20,9 +21,6 @@ struct fulfilled_htlc;
 
 /* View from each side */
 struct channel_view {
-	/* Current feerate in satoshis per 1000 weight. */
-	u32 feerate_per_kw;
-
 	/* How much is owed to each side (includes pending changes) */
 	struct amount_msat owed[NUM_SIDES];
 };
@@ -42,7 +40,7 @@ struct channel {
 	u32 minimum_depth;
 
 	/* Who is paying fees. */
-	enum side funder;
+	enum side opener;
 
 	/* Limits and settings on this channel. */
 	struct channel_config config[NUM_SIDES];
@@ -56,48 +54,47 @@ struct channel {
 	/* All live HTLCs for this channel */
 	struct htlc_map *htlcs;
 
-	/* Do we have changes pending for ourselves/other? */
-	bool changes_pending[NUM_SIDES];
+	/* Fee changes, some which may be in transit */
+	struct fee_states *fee_states;
 
 	/* What it looks like to each side. */
 	struct channel_view view[NUM_SIDES];
 
-	/* Chain params to check against */
-	const struct chainparams *chainparams;
-
 	/* Is this using option_static_remotekey? */
 	bool option_static_remotekey;
+
+	/* Is this using option_anchor_outputs? */
+	bool option_anchor_outputs;
 };
 
 /**
  * new_initial_channel: Given initial fees and funding, what is initial state?
  * @ctx: tal context to allocate return value from.
- * @chain_hash: Which blockchain are we talking about?
  * @funding_txid: The commitment transaction id.
  * @funding_txout: The commitment transaction output number.
  * @minimum_depth: The minimum confirmations needed for funding transaction.
  * @funding_satoshis: The commitment transaction amount.
  * @local_msatoshi: The amount for the local side (remainder goes to remote)
- * @feerate_per_kw: feerate per kiloweight (satoshis) for the commitment
- *   transaction and HTLCS (at this stage, same for both sides)
+ * @fee_states: The fee update states.
  * @local: local channel configuration
  * @remote: remote channel configuration
  * @local_basepoints: local basepoints.
  * @remote_basepoints: remote basepoints.
  * @local_fundingkey: local funding key
  * @remote_fundingkey: remote funding key
- * @funder: which side initiated it.
+ * @option_static_remotekey: was this created with option_static_remotekey?
+ * @option_anchor_outputs: was this created with option_anchor_outputs?
+ * @opener: which side initiated it.
  *
  * Returns channel, or NULL if malformed.
  */
 struct channel *new_initial_channel(const tal_t *ctx,
-				    const struct bitcoin_blkid *chain_hash,
 				    const struct bitcoin_txid *funding_txid,
 				    unsigned int funding_txout,
 				    u32 minimum_depth,
 				    struct amount_sat funding,
 				    struct amount_msat local_msatoshi,
-				    u32 feerate_per_kw,
+				    const struct fee_states *fee_states TAKES,
 				    const struct channel_config *local,
 				    const struct channel_config *remote,
 				    const struct basepoints *local_basepoints,
@@ -105,7 +102,8 @@ struct channel *new_initial_channel(const tal_t *ctx,
 				    const struct pubkey *local_funding_pubkey,
 				    const struct pubkey *remote_funding_pubkey,
 				    bool option_static_remotekey,
-				    enum side funder);
+				    bool option_anchor_outputs,
+				    enum side opener);
 
 
 /**
@@ -115,6 +113,7 @@ struct channel *new_initial_channel(const tal_t *ctx,
  * @channel: The channel to evaluate
  * @per_commitment_point: Per-commitment point to determine keys
  * @side: which side to get the commitment transaction for
+ * @direct_outputs: If non-NULL, fill with pointers to the direct (non-HTLC) outputs (or NULL if none).
  * @err_reason: When NULL is returned, this will point to a human readable reason.
  *
  * Returns the unsigned initial commitment transaction for @side, or NULL
@@ -125,6 +124,14 @@ struct bitcoin_tx *initial_channel_tx(const tal_t *ctx,
 				      const struct channel *channel,
 				      const struct pubkey *per_commitment_point,
 				      enum side side,
+				      struct wally_tx_output *direct_outputs[NUM_SIDES],
 				      char** err_reason);
+
+/**
+ * channel_feerate: Get fee rate for this side of channel.
+ * @channel: The channel
+ * @side: the side
+ */
+u32 channel_feerate(const struct channel *channel, enum side side);
 
 #endif /* LIGHTNING_COMMON_INITIAL_CHANNEL_H */

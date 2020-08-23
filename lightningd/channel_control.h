@@ -26,8 +26,9 @@ void channel_notify_new_block(struct lightningd *ld,
 /* Cancel the channel after `fundchannel_complete` succeeds
  * but before funding broadcasts. */
 struct command_result *cancel_channel_before_broadcast(struct command *cmd,
-						       const char *buffer,
-						       struct peer *peer,
-						       const jsmntok_t *cidtok);
+						       struct peer *peer);
 
+/* Forget a channel. Deletes the channel and handles all
+ * associated waiting commands, if present. Notifies peer if available */
+void forget_channel(struct channel *channel, const char *err_msg);
 #endif /* LIGHTNING_LIGHTNINGD_CHANNEL_CONTROL_H */

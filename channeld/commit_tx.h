@@ -14,7 +14,9 @@ struct keyset;
  * @htlcs: tal_arr of HTLCs
  * @feerate_per_kw: feerate to use
  * @dust_limit: dust limit below which to trim outputs.
+ * @option_anchor_outputs: does option_anchor_outputs apply to this channel?
  * @side: from which side's point of view
+ * @option_anchor_outputs: does option_anchor_outputs apply to this channel?
  *
  * We need @side because HTLC fees are different for offered and
  * received HTLCs.
@@ -22,13 +24,15 @@ struct keyset;
 size_t commit_tx_num_untrimmed(const struct htlc **htlcs,
 			       u32 feerate_per_kw,
 			       struct amount_sat dust_limit,
+			       bool option_anchor_outputs,
 			       enum side side);
 
 /**
  * commit_tx: create (unsigned) commitment tx to spend the funding tx output
  * @ctx: context to allocate transaction and @htlc_map from.
  * @funding_txid, @funding_out, @funding: funding outpoint.
- * @funder: is the LOCAL or REMOTE paying the fee?
+ * @local_funding_key, @remote_funding_key: keys for funding input.
+ * @opener: is the LOCAL or REMOTE paying the fee?
  * @keyset: keys derived for this commit tx.
  * @feerate_per_kw: feerate to use
  * @dust_limit: dust limit below which to trim outputs.
@@ -37,18 +41,22 @@ size_t commit_tx_num_untrimmed(const struct htlc **htlcs,
  * @htlcs: tal_arr of htlcs committed by transaction (some may be trimmed)
  * @htlc_map: outputed map of outnum->HTLC (NULL for direct outputs).
  * @obscured_commitment_number: number to encode in commitment transaction
+ * @direct_outputs: If non-NULL, fill with pointers to the direct (non-HTLC) outputs (or NULL if none).
+ * @option_anchor_outputs: does option_anchor_outputs apply to this channel?
  * @side: side to generate commitment transaction for.
+ * @option_anchor_outputs: does option_anchor_outputs apply to this channel?
  *
  * We need to be able to generate the remote side's tx to create signatures,
  * but the BOLT is expressed in terms of generating our local commitment
  * transaction, so we carefully use the terms "self" and "other" here.
  */
 struct bitcoin_tx *commit_tx(const tal_t *ctx,
-			     const struct chainparams *chainparams,
 			     const struct bitcoin_txid *funding_txid,
 			     unsigned int funding_txout,
 			     struct amount_sat funding,
-			     enum side funder,
+			     const struct pubkey *local_funding_key,
+			     const struct pubkey *remote_funding_key,
+			     enum side opener,
 			     u16 to_self_delay,
 			     const struct keyset *keyset,
 			     u32 feerate_per_kw,
@@ -57,7 +65,9 @@ struct bitcoin_tx *commit_tx(const tal_t *ctx,
 			     struct amount_msat other_pay,
 			     const struct htlc **htlcs,
 			     const struct htlc ***htlcmap,
+			     struct wally_tx_output *direct_outputs[NUM_SIDES],
 			     u64 obscured_commitment_number,
+			     bool option_anchor_outputs,
 			     enum side side);
 
 #endif /* LIGHTNING_CHANNELD_COMMIT_TX_H */

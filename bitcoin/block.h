@@ -10,6 +10,12 @@
 
 struct chainparams;
 
+enum dynafed_params_type {
+	DYNAFED_PARAMS_NULL,
+	DYNAFED_PARAMS_COMPACT,
+	DYNAFED_PARAMS_FULL,
+};
+
 struct bitcoin_blkid {
 	struct sha256_double shad;
 };
@@ -23,21 +29,11 @@ struct bitcoin_block_hdr {
 	le32 timestamp;
 	le32 target;
 	le32 nonce;
-};
-
-struct elements_block_proof {
-	u8 *challenge;
-	u8 *solution;
-};
-
-struct elements_block_hdr {
-	u32 block_height;
-	struct elements_block_proof proof;
+	struct bitcoin_blkid hash;
 };
 
 struct bitcoin_block {
 	struct bitcoin_block_hdr hdr;
-	struct elements_block_hdr *elements_hdr;
 	/* tal_count shows now many */
 	struct bitcoin_tx **tx;
 };
@@ -57,4 +53,13 @@ bool bitcoin_blkid_from_hex(const char *hexstr, size_t hexstr_len,
 /* Get hex string of blockid (reversed, a-la bitcoind). */
 bool bitcoin_blkid_to_hex(const struct bitcoin_blkid *blockid,
 			  char *hexstr, size_t hexstr_len);
+
+/* Marshalling/unmarshaling over the wire */
+void towire_bitcoin_blkid(u8 **pptr, const struct bitcoin_blkid *blkid);
+void fromwire_bitcoin_blkid(const u8 **cursor, size_t *max,
+			   struct bitcoin_blkid *blkid);
+void fromwire_chainparams(const u8 **cursor, size_t *max,
+			  const struct chainparams **chainparams);
+void towire_chainparams(u8 **cursor, const struct chainparams *chainparams);
+
 #endif /* LIGHTNING_BITCOIN_BLOCK_H */

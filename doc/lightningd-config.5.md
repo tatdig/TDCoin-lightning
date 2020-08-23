@@ -9,14 +9,18 @@ SYNOPSIS
 DESCRIPTION
 -----------
 
-When lightningd(8) starts up, it reads a configuration file. By default
-that is *config* in the **.lightning** subdirectory of the home
-directory (if it exists), but that can be changed by the
-*--lightning-dir* or *--conf* options on the lightningd(8) command line.
+When lightningd(8) starts up it usually reads a general configuration
+file (default: **$HOME/.lightning/config**) then a network-specific
+configuration file (default: **$HOME/.lightning/testnet/config**).  This can
+be changed: see *--conf* and *--lightning-dir*.
 
-Configuration file options are processed first, then command line
-options: later options override earlier ones except *addr* options which
+General configuration files are processed first, then network-specific
+ones, then command line options: later options override earlier ones
+except *addr* options and *log-level* with subsystems, which
 accumulate.
+
+*include * followed by a filename includes another configuration file at that
+point, relative to the current configuration file.
 
 All these options are mirrored as commandline arguments to
 lightningd(8), so *--foo* becomes simply *foo* in the configuration
@@ -57,6 +61,7 @@ Bitcoin control options:
 
  **network**=*NETWORK*
 Select the network parameters (*bitcoin*, *testnet*, or *regtest*).
+This is not valid within the per-network configuration file.
 
  **testnet**
 Alias for *network=testnet*.
@@ -98,14 +103,51 @@ wrong.
 
  **lightning-dir**=*DIR*
 Sets the working directory. All files (except *--conf* and
-*--lightning-dir* on the command line) are relative to this.
+*--lightning-dir* on the command line) are relative to this.  This
+is only valid on the command-line, or in a configuration file specified
+by *--conf*.
+
+ **subdaemon**=*SUBDAEMON*:*PATH*
+Specifies an alternate subdaemon binary.
+Current subdaemons are *channeld*, *closingd*,
+*connectd*, *gossipd*, *hsmd*, *onchaind*, and *openingd*.
+If the supplied path is relative the subdaemon binary is found in the
+working directory. This option may be specified multiple times.
+
+ So, **subdaemon=hsmd:remote_signer** would use a
+hypothetical remote signing proxy instead of the standard *lightning_hsmd*
+binary.
 
  **pid-file**=*PATH*
 Specify pid file to write to.
 
- **log-level**=*LEVEL*
+ **log-level**=*LEVEL*\[:*SUBSYSTEM*\]
 What log level to print out: options are io, debug, info, unusual,
-broken.
+broken.  If *SUBSYSTEM* is supplied, this sets the logging level
+for any subsystem containing that string.  Subsystems include:
+
+* *lightningd*: The main lightning daemon
+* *database*: The database subsystem
+* *wallet*: The wallet subsystem
+* *gossipd*: The gossip daemon
+* *plugin-manager*: The plugin subsystem
+* *plugin-P*: Each plugin, P = plugin path without directory
+* *hsmd*: The secret-holding daemon
+* *connectd*: The network connection daemon
+* *jsonrpc#FD*: Each JSONRPC connection, FD = file descriptor number
+
+
+  The following subsystems exist for each channel, where N is an incrementing
+internal integer id assigned for the lifetime of the channel:
+* *openingd-chan#N*: Each opening / idling daemon
+* *channeld-chan#N*: Each channel management daemon
+* *closingd-chan#N*: Each closing negotiation daemon
+* *onchaind-chan#N*: Each onchain close handling daemon
+
+
+  So, **log-level=debug:plugin** would set debug level logging on all
+plugins and the plugin manager.  **log-level=io:chan#55** would set
+IO logging on channel number 55 (or 550, for that matter).
 
  **log-prefix**=*PREFIX*
 Prefix for log lines: this can be customized if you want to merge logs
@@ -118,36 +160,63 @@ cause it to reopen this file (useful for log rotation).
  **rpc-file**=*PATH*
 Set JSON-RPC socket (or /dev/tty), such as for lightning-cli(1).
 
+ **rpc-file-mode**=*MODE*
+Set JSON-RPC socket file mode, as a 4-digit octal number.
+Default is 0600, meaning only the user that launched lightningd
+can command it.
+Set to 0660 to allow users with the same group to access the RPC
+as well.
+
  **daemon**
 Run in the background, suppress stdout and stderr.
 
  **conf**=*PATH*
-Sets configuration file (default: **lightning-dir**/*config* ). If this
-is a relative path, it is relative to the starting directory, not
+Sets configuration file, and disable reading the normal general and network
+ones. If this is a relative path, it is relative to the starting directory, not
 **lightning-dir** (unlike other paths). *PATH* must exist and be
 readable (we allow missing files in the default case). Using this inside
-a configuration file is meaningless.
+a configuration file is invalid.
 
  **wallet**=*DSN*
 Identify the location of the wallet. This is a fully qualified data source
 name, including a scheme such as `sqlite3` or `postgres` followed by the
 connection parameters.
 
+The default wallet corresponds to the following DSN:
+
+```
+--wallet=sqlite3://$HOME/.lightning/bitcoin/lightningd.sqlite3
+```
+
+The following is an example of a postgresql wallet DSN:
+
+```
+--wallet=postgres://user:pass@localhost:5432/db_name
+```
+
+This will connect to a the DB server running on `localhost` port `5432`,
+authenticate with username `user` and password `pass`, and then use the
+database `db_name`. The database must exist, but the schema will be managed
+automatically by `lightningd`.
+
  **encrypted-hsm**
 If set, you will be prompted to enter a password used to encrypt the `hsm_secret`.
 Note that once you encrypt the `hsm_secret` this option will be mandatory for
 `lightningd` to start.
+If there is no `hsm_secret` yet, `lightningd` will create a new encrypted secret.
+If you have an unencrypted `hsm_secret` you want to encrypt on-disk, or vice versa,
+see lightning-hsmtool(8).
 
 ### Lightning node customization options
 
- **alias**=*RRGGBB*
- **rgb**=*RRGGBB*
-Your favorite color as a hex code.
-
-Up to 32 UTF-8 characters to tag your node. Completely silly, since
+ **alias**=*NAME*
+Up to 32 bytes of UTF-8 characters to tag your node. Completely silly, since
 anyone can call their node anything they want. The default is an
 NSA-style codename derived from your public key, but "Peter Todd" and
 "VAULTERO" are good options, too.
+
+ **rgb**=*RRGGBB*
+Your favorite color as a hex code.
 
  **fee-base**=*MILLISATOSHI*
 Default: 1000. The base fee to charge for every payment which passes
@@ -174,12 +243,19 @@ This may result in a channel which cannot be closed, should fees
 increase, but make channels far more reliable since we never close it
 due to unreasonable fees.
 
- **commit-time**='MILLISECONDS
+ **commit-time**=*MILLISECONDS*
 How long to wait before sending commitment messages to the peer: in
 theory increasing this would reduce load, but your node would have to be
 extremely busy node for you to even notice.
 
 ### Lightning channel and HTLC options
+
+ **large-channels**
+Removes capacity limits for channel creation.  Version 1.0 of the specification
+limited channel sizes to 16777215 satoshi.  With this option (which your
+node will advertize to peers), your node will accept larger incoming channels
+and if the peer supports it, will open larger channels.  Note: this option
+is spelled **large-channels** but it's pronounced **wumbo**.
 
  **watchtime-blocks**=*BLOCKS*
 How long we need to spot an outdated close attempt: on opening a channel
@@ -197,8 +273,8 @@ Confirmations required for the funding transaction when the other side
 opens a channel before the channel is usable.
 
  **commit-fee**=*PERCENT*
-The percentage of *estimatesmartfee 2* to use for the bitcoin
-transaction which funds a channel: can be greater than 100.
+The percentage of *estimatesmartfee 2/CONSERVATIVE* to use for the commitment
+transactions: default is 100.
 
  **commit-fee-min**=*PERCENT*
  **commit-fee-max**=*PERCENT*
@@ -233,6 +309,14 @@ up space in the database.
 Control how long invoices must have been expired before they are cleaned
 (if *autocleaninvoice-cycle* is non-zero).
 
+Payment control options:
+
+ **disable-mpp**
+Disable the multi-part payment sending support in the `pay` plugin. By default
+the MPP support is enabled, but it can be desirable to disable in situations
+in which each payment should result in a single HTLC being forwarded in the
+network.
+
 ### Networking options
 
 Note that for simple setups, the implicit *autolisten* option does the
@@ -244,57 +328,67 @@ precisely control where to bind and what to announce with the
 *bind-addr* and *announce-addr* options. These will **disable** the
 *autolisten* logic, so you must specifiy exactly what you want!
 
- **addr**=*\[IPADDRESS\[:PORT\]\]|autotor:TORIPADDRESS\[:TORPORT\]*
+ **addr**=*\[IPADDRESS\[:PORT\]\]|autotor:TORIPADDRESS\[:SERVICEPORT\]\[/torport=TORPORT\]|statictor:TORIPADDRESS\[:SERVICEPORT\]\[/torport=TORPORT\]\[/torblob=\[blob\]\]*
+
 Set an IP address (v4 or v6) or automatic Tor address to listen on and
 (maybe) announce as our node address.
 
-    An empty 'IPADDRESS' is a special value meaning bind to IPv4 and/or
-    IPv6 on all interfaces, '0.0.0.0' means bind to all IPv4
-    interfaces, '::' means 'bind to all IPv6 interfaces'.  If 'PORT' is
-    not specified, 9735 is used.  If we can determine a public IP
-    address from the resulting binding, and no other addresses of the
-    same type are already announced, the address is announced.
+An empty 'IPADDRESS' is a special value meaning bind to IPv4 and/or
+IPv6 on all interfaces, '0.0.0.0' means bind to all IPv4
+interfaces, '::' means 'bind to all IPv6 interfaces'.  If 'PORT' is
+not specified, 9735 is used.  If we can determine a public IP
+address from the resulting binding, the address is announced.
 
-    If the argument begins with 'autotor:' then it is followed by the
-    IPv4 or IPv6 address of the Tor control port (default port 9051),
-    and this will be used to configure a Tor hidden service for port
-    9735.  The Tor hidden service will be configured to point to the
-    first IPv4 or IPv6 address we bind to.
+If the argument begins with 'autotor:' then it is followed by the
+IPv4 or IPv6 address of the Tor control port (default port 9051),
+and this will be used to configure a Tor hidden service for port 9735.
+The Tor hidden service will be configured to point to the
+first IPv4 or IPv6 address we bind to.
 
-    This option can be used multiple times to add more addresses, and
-    its use disables autolisten.  If necessary, and 'always-use-proxy'
-    is not specified, a DNS lookup may be done to resolve 'IPADDRESS'
-    or 'TORIPADDRESS'.
+If the argument begins with 'statictor:' then it is followed by the
+IPv4 or IPv6 address of the Tor control port (default port 9051),
+and this will be used to configure a static Tor hidden service for port 9735.
+The Tor hidden service will be configured to point to the
+first IPv4 or IPv6 address we bind to and is by default unique to
+your nodes id. You can add the text '/torblob=BLOB' followed by up to
+64 Bytes of text to generate from this text a v3 onion service
+address text unique to the first 32 Byte of this text.
+You can also use an postfix '/torport=TORPORT' to select the external
+tor binding. The result is that over tor your node is accessible by a port
+defined by you and possible different from your local node port assignment
+
+This option can be used multiple times to add more addresses, and
+its use disables autolisten.  If necessary, and 'always-use-proxy'
+is not specified, a DNS lookup may be done to resolve 'IPADDRESS'
+or 'TORIPADDRESS'.
 
  **bind-addr**=*\[IPADDRESS\[:PORT\]\]|SOCKETPATH*
 Set an IP address or UNIX domain socket to listen to, but do not
 announce. A UNIX domain socket is distinguished from an IP address by
 beginning with a */*.
 
-    An empty 'IPADDRESS' is a special value meaning bind to IPv4 and/or
-    IPv6 on all interfaces, '0.0.0.0' means bind to all IPv4
-    interfaces, '::' means 'bind to all IPv6 interfaces'.  'PORT' is
-    not specified, 9735 is used.
+An empty 'IPADDRESS' is a special value meaning bind to IPv4 and/or
+IPv6 on all interfaces, '0.0.0.0' means bind to all IPv4
+interfaces, '::' means 'bind to all IPv6 interfaces'.  'PORT' is
+not specified, 9735 is used.
 
-    This option can be used multiple times to add more addresses, and
-    its use disables autolisten.  If necessary, and 'always-use-proxy'
-    is not specified, a DNS lookup may be done to resolve 'IPADDRESS'.
+This option can be used multiple times to add more addresses, and
+its use disables autolisten.  If necessary, and 'always-use-proxy'
+is not specified, a DNS lookup may be done to resolve 'IPADDRESS'.
 
  **announce-addr**=*IPADDRESS\[:PORT\]|TORADDRESS.onion\[:PORT\]*
 Set an IP (v4 or v6) address or Tor address to announce; a Tor address
 is distinguished by ending in *.onion*. *PORT* defaults to 9735.
 
-    Empty or wildcard IPv4 and IPv6 addresses don't make sense here.
-    Also, unlike the 'addr' option, there is no checking that your
-    announced addresses are public (e.g. not localhost).
+Empty or wildcard IPv4 and IPv6 addresses don't make sense here.
+Also, unlike the 'addr' option, there is no checking that your
+announced addresses are public (e.g. not localhost).
 
-    This option can be used multiple times to add more addresses, and
-    its use disables autolisten.  The spec says you can't announce
-    more that one address of the same type (eg. two IPv4 or two IPv6
-    addresses) so `lightningd` will refuse if you specify more than one.
+This option can be used multiple times to add more addresses, and
+its use disables autolisten.
 
-    If necessary, and 'always-use-proxy' is not specified, a DNS
-    lookup may be done to resolve 'IPADDRESS'.
+If necessary, and 'always-use-proxy' is not specified, a DNS
+lookup may be done to resolve 'IPADDRESS'.
 
  **offline**
 Do not bind to any ports, and do not try to reconnect to any peers. This
@@ -345,15 +439,29 @@ loaded. *DIRECTORY* must exist; this can be specified multiple times to
 add multiple directories.
 
  **clear-plugins**
-This option clears all *plugin* and *plugin-dir* options preceeding it,
+This option clears all *plugin*, *important-plugin*, and *plugin-dir* options
+preceeding it,
 including the default built-in plugin directory. You can still add
-*plugin-dir* and *plugin* options following this and they will have the
-normal effect.
+*plugin-dir*, *plugin*, and *important-plugin* options following this
+and they will have the normal effect.
 
  **disable-plugin**=*PLUGIN*
-If *PLUGIN* contains a /, plugins with the same path as *PLUGIN* are
-disabled. Otherwise, any plugin with that base name is disabled,
-whatever directory it is in.
+If *PLUGIN* contains a /, plugins with the same path as *PLUGIN* will
+not be loaded at startup. Otherwise, no plugin with that base name will
+be loaded at startup, whatever directory it is in.  This option is useful for
+disabling a single plugin inside a directory.  You can still explicitly
+load plugins which have been disabled, using lightning-plugin(7) `start`.
+
+ **important-plugin**=*PLUGIN*
+Speciy a plugin to run as part of C-lightning.
+This can be specified multiple times to add multiple plugins.
+Plugins specified via this option are considered so important, that if the
+plugin stops for any reason (including via lightning-plugin(7) `stop`),
+C-lightning will also stop running.
+This way, you can monitor crashes of important plugins by simply monitoring
+if C-lightning terminates.
+Built-in plugins, which are installed with lightningd(8), are automatically
+considered important.
 
 BUGS
 ----
@@ -372,6 +480,7 @@ SEE ALSO
 --------
 
 lightning-listconfigs(7) lightning-setchannelfee(7) lightningd(8)
+lightning-hsmtool(8)
 
 RESOURCES
 ---------

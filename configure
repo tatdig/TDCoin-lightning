@@ -139,11 +139,11 @@ usage()
     usage_with_default "--enable/disable-developer" "$DEVELOPER" "enable" "disable"
     echo "    Developer mode, good for testing"
     usage_with_default "--enable/disable-experimental-features" "$EXPERIMENTAL_FEATURES" "enable" "disable"
-    echo "    Developer mode, good for testing"
+    echo "    Enable experimental features"
     usage_with_default "--enable/disable-compat" "$COMPAT" "enable" "disable"
     echo "    Compatibility mode, good to disable to see if your software breaks"
     usage_with_default "--enable/disable-valgrind" "(autodetect)"
-    echo "    Valgrind binary to use for tests"
+    echo "    Run tests with Valgrind"
     usage_with_default "--enable/disable-static" "$STATIC" "enable" "disable"
     echo "    Static link sqlite3, gmp and zlib libraries"
     usage_with_default "--enable/disable-address-sanitizer" "$ASAN" "enable" "disable"
@@ -230,7 +230,7 @@ fi
 require 'python3-mako' "You need the mako module for python3: see doc/INSTALL.md" python3 -c 'import mako'
 
 rm -f $CONFIG_VAR_FILE.$$
-$CONFIGURATOR --extra-tests --autotools-style --var-file=$CONFIG_VAR_FILE.$$ --header-file=$CONFIG_HEADER --configurator-cc="$CONFIGURATOR_CC" "$CC" ${CWARNFLAGS-$BASE_WARNFLAGS} $CDEBUGFLAGS $COPTFLAGS -I/usr/local/include -L/usr/local/lib <<EOF
+$CONFIGURATOR --extra-tests --autotools-style --var-file=$CONFIG_VAR_FILE.$$ --header-file=$CONFIG_HEADER --configurator-cc="$CONFIGURATOR_CC" --wrapper="$CONFIGURATOR_WRAPPER" "$CC" ${CWARNFLAGS-$BASE_WARNFLAGS} $CDEBUGFLAGS $COPTFLAGS -I/usr/local/include -L/usr/local/lib <<EOF
 var=HAVE_GOOD_LIBSODIUM
 desc=libsodium with IETF chacha20 variants
 style=DEFINES_EVERYTHING|EXECUTE|MAY_NOT_COMPILE

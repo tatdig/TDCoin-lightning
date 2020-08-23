@@ -22,11 +22,16 @@ struct txwatch;
 
 /* FIXME: move all feerate stuff out to new lightningd/feerate.[ch] files */
 enum feerate {
-	FEERATE_URGENT, /* Aka: aim for next block. */
-	FEERATE_NORMAL, /* Aka: next 4 blocks or so. */
-	FEERATE_SLOW, /* Aka: next 100 blocks or so. */
+	FEERATE_OPENING,
+	FEERATE_MUTUAL_CLOSE,
+	FEERATE_UNILATERAL_CLOSE,
+	FEERATE_DELAYED_TO_US,
+	FEERATE_HTLC_RESOLUTION,
+	FEERATE_PENALTY,
+	FEERATE_MIN,
+	FEERATE_MAX,
 };
-#define NUM_FEERATES (FEERATE_SLOW+1)
+#define NUM_FEERATES (FEERATE_MAX+1)
 
 /* We keep the last three in case there are outliers (for min/max) */
 #define FEE_HISTORY_NUM 3
@@ -37,7 +42,7 @@ struct outgoing_tx {
 	struct channel *channel;
 	const char *hextx;
 	struct bitcoin_txid txid;
-	void (*failed_or_success)(struct channel *channel, int exitstatus, const char *err);
+	void (*failed_or_success)(struct channel *channel, bool success, const char *err);
 };
 
 struct block {
@@ -55,10 +60,7 @@ struct block {
 	/* Key for hash table */
 	struct bitcoin_blkid blkid;
 
-	/* And their associated index in the block */
-	u32 *txnums;
-
-	/* Full copy of txs (trimmed to txs list in connect_block) */
+	/* Full copy of txs (freed in filter_block_txs) */
 	struct bitcoin_tx **full_txs;
 };
 
@@ -85,7 +87,8 @@ HTABLE_DEFINE_TYPE(struct block, keyof_block_map, hash_sha, block_eq, block_map)
 struct chain_topology {
 	struct lightningd *ld;
 	struct block *root;
-	struct block *prev_tip, *tip;
+	struct block *tip;
+	struct bitcoin_blkid prev_tip;
 	struct block_map block_map;
 	u32 feerate[NUM_FEERATES];
 	bool feerate_uninitialized;
@@ -117,6 +120,10 @@ struct chain_topology {
 	/* Transactions/txos we are watching. */
 	struct txwatch_hash txwatches;
 	struct txowatch_hash txowatches;
+
+	/* The number of headers known to the bitcoin backend at startup. Not
+	 * updated after the initial check. */
+	u32 headercount;
 };
 
 /* Information relevant to locating a TX in a blockchain. */
@@ -137,6 +144,13 @@ size_t get_tx_depth(const struct chain_topology *topo,
 /* Get highest block number. */
 u32 get_block_height(const struct chain_topology *topo);
 
+/* Get the highest block number in the network that we are aware of. Unlike
+ * `get_block_height` this takes into consideration the block header counter
+ * in the bitcoin backend as well. If an absolute time is required, rather
+ * than our current scan position this is preferable since it is far less
+ * likely to lag behind the rest of the network.*/
+u32 get_network_blockheight(const struct chain_topology *topo);
+
 /* Get fee rate in satoshi per kiloweight, or 0 if unavailable! */
 u32 try_get_feerate(const struct chain_topology *topo, enum feerate feerate);
 
@@ -145,13 +159,13 @@ u32 try_get_feerate(const struct chain_topology *topo, enum feerate feerate);
 u32 feerate_min(struct lightningd *ld, bool *unknown);
 u32 feerate_max(struct lightningd *ld, bool *unknown);
 
-u32 mutual_close_feerate(struct chain_topology *topo);
 u32 opening_feerate(struct chain_topology *topo);
+u32 mutual_close_feerate(struct chain_topology *topo);
 u32 unilateral_feerate(struct chain_topology *topo);
-
-/* We always use feerate-per-ksipa, ie. perkw */
-u32 feerate_from_style(u32 feerate, enum feerate_style style);
-u32 feerate_to_style(u32 feerate_perkw, enum feerate_style style);
+/* For onchain resolution. */
+u32 delayed_to_us_feerate(struct chain_topology *topo);
+u32 htlc_resolution_feerate(struct chain_topology *topo);
+u32 penalty_feerate(struct chain_topology *topo);
 
 const char *feerate_name(enum feerate feerate);
 
@@ -165,7 +179,7 @@ struct command_result *param_feerate_estimate(struct command *cmd,
 void broadcast_tx(struct chain_topology *topo,
 		  struct channel *channel, const struct bitcoin_tx *tx,
 		  void (*failed)(struct channel *channel,
-				 int exitstatus,
+				 bool success,
 				 const char *err));
 
 struct chain_topology *new_topology(struct lightningd *ld, struct log *log);

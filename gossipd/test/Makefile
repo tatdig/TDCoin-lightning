@@ -9,6 +9,7 @@ GOSSIPD_TEST_PROGRAMS := $(GOSSIPD_TEST_OBJS:.o=)
 GOSSIPD_TEST_COMMON_OBJS :=			\
 	common/amount.o				\
 	common/bigsize.o			\
+	common/channel_id.o			\
 	common/features.o			\
 	common/node_id.o			\
 	common/json.o				\
@@ -18,7 +19,6 @@ GOSSIPD_TEST_COMMON_OBJS :=			\
 	common/utils.o				\
 	wire/gen_peer_wire.o			\
 	wire/fromwire.o				\
-	wire/tlvstream.o			\
 	wire/towire.o
 
 update-mocks: $(GOSSIPD_TEST_SRC:%=update-mocks/%)

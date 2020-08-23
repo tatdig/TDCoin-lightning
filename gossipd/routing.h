@@ -41,6 +41,10 @@ struct half_chan {
 	/* Token bucket */
 	u8 tokens;
 
+	/* Feature cache for parent chan: squeezed in here where it would
+	 * otherwise simply be padding. */
+	u8 any_features;
+
 	/* Minimum and maximum number of msatoshi in an HTLC */
 	struct amount_msat htlc_minimum, htlc_maximum;
 };
@@ -133,6 +137,11 @@ HTABLE_DEFINE_TYPE(struct local_chan,
 		   local_chan_map_scid, hash_scid, local_chan_eq_scid,
 		   local_chan_map);
 
+enum route_hop_style {
+	ROUTE_HOP_LEGACY = 1,
+	ROUTE_HOP_TLV = 2,
+};
+
 /* For a small number of channels (by far the most common) we use a simple
  * array, with empty buckets NULL.  For larger, we use a proper hash table,
  * with the extra allocation that implies. */
@@ -146,6 +155,9 @@ struct node {
 
 	/* Token bucket */
 	u8 tokens;
+
+	/* route_hop_style */
+	enum route_hop_style hop_style;
 
 	/* Channels connecting us to other nodes */
 	union {
@@ -252,9 +264,6 @@ static inline int half_chan_to(const struct node *n, const struct chan *chan)
 }
 
 struct routing_state {
-	/* Which chain we're on */
-	const struct chainparams *chainparams;
-
 	/* TImers base from struct gossipd. */
 	struct timers *timers;
 
@@ -320,6 +329,9 @@ struct route_hop {
 	struct node_id nodeid;
 	struct amount_msat amount;
 	u32 delay;
+	struct pubkey *blinding;
+	u8 *enctlv;
+	enum route_hop_style style;
 };
 
 enum exclude_entry_type {
@@ -336,7 +348,6 @@ struct exclude_entry {
 };
 
 struct routing_state *new_routing_state(const tal_t *ctx,
-					const struct chainparams *chainparams,
 					const struct node_id *local_id,
 					struct list_head *peers,
 					struct timers *timers,
@@ -354,7 +365,8 @@ struct chan *new_chan(struct routing_state *rstate,
 		      const struct short_channel_id *scid,
 		      const struct node_id *id1,
 		      const struct node_id *id2,
-		      struct amount_sat sat);
+		      struct amount_sat sat,
+		      const u8 *features);
 
 /* Handlers for incoming messages */
 
@@ -403,22 +415,15 @@ struct node *get_node(struct routing_state *rstate,
 		      const struct node_id *id);
 
 /* Compute a route to a destination, for a given amount and riskfactor. */
-struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
-			    const struct node_id *source,
-			    const struct node_id *destination,
-			    const struct amount_msat msat, double riskfactor,
-			    u32 final_cltv,
-			    double fuzz,
-			    u64 seed,
-			    struct exclude_entry **excluded,
-			    u32 max_hops);
-/* Disable channel(s) based on the given routing failure. */
-void routing_failure(struct routing_state *rstate,
-		     const struct node_id *erring_node,
-		     const struct short_channel_id *erring_channel,
-		     int erring_direction,
-		     enum onion_type failcode,
-		     const u8 *channel_update);
+struct route_hop **get_route(const tal_t *ctx, struct routing_state *rstate,
+			     const struct node_id *source,
+			     const struct node_id *destination,
+			     const struct amount_msat msat, double riskfactor,
+			     u32 final_cltv,
+			     double fuzz,
+			     u64 seed,
+			     struct exclude_entry **excluded,
+			     u32 max_hops);
 
 void route_prune(struct routing_state *rstate);
 
@@ -473,7 +478,9 @@ bool routing_add_node_announcement(struct routing_state *rstate,
  * is the case for private channels or channels that have not yet reached
  * `announce_depth`.
  */
-bool handle_local_add_channel(struct routing_state *rstate, const u8 *msg,
+bool handle_local_add_channel(struct routing_state *rstate,
+			      const struct peer *peer,
+			      const u8 *msg,
 			      u64 index);
 
 /**

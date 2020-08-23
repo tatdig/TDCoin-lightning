@@ -17,37 +17,50 @@ LIGHTNINGD_COMMON_OBJS :=			\
 	common/addr.o				\
 	common/amount.o				\
 	common/base32.o				\
+	common/base64.o				\
 	common/bech32.o				\
 	common/bech32_util.o			\
 	common/bigsize.o			\
 	common/bip32.o				\
+	common/blinding.o			\
 	common/bolt11.o				\
+	common/channel_id.o			\
 	common/channel_config.o			\
+	common/coin_mvt.o			\
 	common/configdir.o			\
 	common/crypto_state.o			\
 	common/daemon.o				\
 	common/derive_basepoints.o		\
+	common/ecdh_hsmd.o			\
 	common/features.o			\
+	common/fee_states.o			\
 	common/funding_tx.o			\
 	common/gen_peer_status_wire.o		\
 	common/gen_status_wire.o		\
 	common/gossip_rcvd_filter.o		\
 	common/hash_u5.o			\
+	common/hmac.o				\
 	common/htlc_state.o			\
 	common/htlc_trim.o			\
 	common/htlc_wire.o			\
 	common/key_derive.o			\
+	common/keyset.o				\
 	common/io_lock.o			\
 	common/json.o				\
 	common/json_helpers.o			\
+	common/json_stream.o			\
 	common/json_tok.o			\
 	common/memleak.o			\
 	common/msg_queue.o			\
 	common/node_id.o			\
+	common/onion.o				\
+	common/onionreply.o			\
 	common/param.o				\
+	common/penalty_base.o			\
 	common/per_peer_state.o			\
 	common/permute_tx.o			\
 	common/pseudorand.o			\
+	common/setup.o				\
 	common/sphinx.o				\
 	common/status_wire.o			\
 	common/timeout.o			\
@@ -68,15 +81,17 @@ LIGHTNINGD_SRC :=				\
 	lightningd/channel.c			\
 	lightningd/channel_control.c		\
 	lightningd/closing_control.c		\
+	lightningd/coin_mvts.c			\
 	lightningd/connect_control.c		\
+	lightningd/onion_message.c		\
 	lightningd/gossip_control.c		\
 	lightningd/gossip_msg.c			\
 	lightningd/hsm_control.c		\
 	lightningd/htlc_end.c			\
+	lightningd/htlc_set.c			\
 	lightningd/invoice.c			\
 	lightningd/io_loop_with_timers.c	\
 	lightningd/json.c			\
-	lightningd/json_stream.c		\
 	lightningd/jsonrpc.c			\
 	lightningd/lightningd.c			\
 	lightningd/log.c			\
@@ -121,6 +136,9 @@ include wallet/Makefile
 LIGHTNINGD_HEADERS = $(LIGHTNINGD_HEADERS_NOGEN) $(LIGHTNINGD_HEADERS_GEN) $(WALLET_LIB_HEADERS)
 
 $(LIGHTNINGD_OBJS): $(LIGHTNINGD_HEADERS)
+
+# Only the plugin component needs to depend on this header.
+lightningd/plugin.o : gen_list_of_builtin_plugins.h
 
 lightningd/gen_channel_state_names.h: lightningd/channel_state.h ccan/ccan/cdump/tools/cdump-enumstr
 	ccan/ccan/cdump/tools/cdump-enumstr lightningd/channel_state.h > $@

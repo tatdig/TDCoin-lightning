@@ -5,11 +5,12 @@
  * getchannels:
  * {'channels': [{'active': True, 'short_id': '6990x2x1/1', 'fee_per_kw': 10, 'delay': 5, 'message_flags': 0, 'channel_flags': 1, 'destination': '0230ad0e74ea03976b28fda587bb75bdd357a1938af4424156a18265167f5e40ae', 'source': '02ea622d5c8d6143f15ed3ce1d501dd0d3d09d3b1c83a44d0034949f8a9ab60f06', 'last_update': 1504064344}, {'active': True, 'short_id': '6989x2x1/0', 'fee_per_kw': 10, 'delay': 5, 'message_flags': 0, 'channel_flags': 0, 'destination': '03c173897878996287a8100469f954dd820fcd8941daed91c327f168f3329be0bf', 'source': '0230ad0e74ea03976b28fda587bb75bdd357a1938af4424156a18265167f5e40ae', 'last_update': 1504064344}, {'active': True, 'short_id': '6990x2x1/0', 'fee_per_kw': 10, 'delay': 5, 'message_flags': 0, 'channel_flags': 0, 'destination': '02ea622d5c8d6143f15ed3ce1d501dd0d3d09d3b1c83a44d0034949f8a9ab60f06', 'source': '0230ad0e74ea03976b28fda587bb75bdd357a1938af4424156a18265167f5e40ae', 'last_update': 1504064344}, {'active': True, 'short_id': '6989x2x1/1', 'fee_per_kw': 10, 'delay': 5, 'message_flags': 0, 'channel_flags': 1, 'destination': '0230ad0e74ea03976b28fda587bb75bdd357a1938af4424156a18265167f5e40ae', 'source': '03c173897878996287a8100469f954dd820fcd8941daed91c327f168f3329be0bf', 'last_update': 1504064344}]}
  */
+#include <common/json_stream.h>
 #include <common/status.h>
 
 #include <stdio.h>
-#define status_fmt(level, fmt, ...)					\
-	do { printf((fmt) ,##__VA_ARGS__); printf("\n"); } while(0)
+#define status_fmt(level, node_id, fmt, ...)				\
+	do { (void)node_id; printf((fmt) ,##__VA_ARGS__); printf("\n"); } while(0)
 
 #include "../routing.c"
 #include "../gossip_store.c"
@@ -20,18 +21,43 @@ bool cupdate_different(struct gossip_store *gs UNNEEDED,
 		       const struct half_chan *hc UNNEEDED,
 		       const u8 *cupdate UNNEEDED)
 { fprintf(stderr, "cupdate_different called!\n"); abort(); }
-/* Generated stub for fromwire_gossipd_local_add_channel */
-bool fromwire_gossipd_local_add_channel(const void *p UNNEEDED, struct short_channel_id *short_channel_id UNNEEDED, struct node_id *remote_node_id UNNEEDED, struct amount_sat *satoshis UNNEEDED)
-{ fprintf(stderr, "fromwire_gossipd_local_add_channel called!\n"); abort(); }
+/* Generated stub for fmt_wireaddr_without_port */
+char *fmt_wireaddr_without_port(const tal_t *ctx UNNEEDED, const struct wireaddr *a UNNEEDED)
+{ fprintf(stderr, "fmt_wireaddr_without_port called!\n"); abort(); }
 /* Generated stub for fromwire_gossip_store_channel_amount */
 bool fromwire_gossip_store_channel_amount(const void *p UNNEEDED, struct amount_sat *satoshis UNNEEDED)
 { fprintf(stderr, "fromwire_gossip_store_channel_amount called!\n"); abort(); }
 /* Generated stub for fromwire_gossip_store_private_update */
 bool fromwire_gossip_store_private_update(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u8 **update UNNEEDED)
 { fprintf(stderr, "fromwire_gossip_store_private_update called!\n"); abort(); }
+/* Generated stub for fromwire_gossipd_local_add_channel */
+bool fromwire_gossipd_local_add_channel(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct short_channel_id *short_channel_id UNNEEDED, struct node_id *remote_node_id UNNEEDED, struct amount_sat *satoshis UNNEEDED, u8 **features UNNEEDED)
+{ fprintf(stderr, "fromwire_gossipd_local_add_channel called!\n"); abort(); }
 /* Generated stub for fromwire_wireaddr */
 bool fromwire_wireaddr(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct wireaddr *addr UNNEEDED)
 { fprintf(stderr, "fromwire_wireaddr called!\n"); abort(); }
+/* Generated stub for json_add_member */
+void json_add_member(struct json_stream *js UNNEEDED,
+		     const char *fieldname UNNEEDED,
+		     bool quote UNNEEDED,
+		     const char *fmt UNNEEDED, ...)
+{ fprintf(stderr, "json_add_member called!\n"); abort(); }
+/* Generated stub for json_array_end */
+void json_array_end(struct json_stream *js UNNEEDED)
+{ fprintf(stderr, "json_array_end called!\n"); abort(); }
+/* Generated stub for json_array_start */
+void json_array_start(struct json_stream *js UNNEEDED, const char *fieldname UNNEEDED)
+{ fprintf(stderr, "json_array_start called!\n"); abort(); }
+/* Generated stub for json_member_direct */
+char *json_member_direct(struct json_stream *js UNNEEDED,
+			 const char *fieldname UNNEEDED, size_t extra UNNEEDED)
+{ fprintf(stderr, "json_member_direct called!\n"); abort(); }
+/* Generated stub for json_object_end */
+void json_object_end(struct json_stream *js UNNEEDED)
+{ fprintf(stderr, "json_object_end called!\n"); abort(); }
+/* Generated stub for json_object_start */
+void json_object_start(struct json_stream *ks UNNEEDED, const char *fieldname UNNEEDED)
+{ fprintf(stderr, "json_object_start called!\n"); abort(); }
 /* Generated stub for memleak_add_helper_ */
 void memleak_add_helper_(const tal_t *p UNNEEDED, void (*cb)(struct htable *memtable UNNEEDED,
 						    const tal_t *)){ }
@@ -43,9 +69,6 @@ bool nannounce_different(struct gossip_store *gs UNNEEDED,
 /* Generated stub for notleak_ */
 void *notleak_(const void *ptr UNNEEDED, bool plus_children UNNEEDED)
 { fprintf(stderr, "notleak_ called!\n"); abort(); }
-/* Generated stub for onion_type_name */
-const char *onion_type_name(int e UNNEEDED)
-{ fprintf(stderr, "onion_type_name called!\n"); abort(); }
 /* Generated stub for peer_supplied_good_gossip */
 void peer_supplied_good_gossip(struct peer *peer UNNEEDED, size_t amount UNNEEDED)
 { fprintf(stderr, "peer_supplied_good_gossip called!\n"); abort(); }
@@ -108,7 +131,7 @@ get_or_make_connection(struct routing_state *rstate,
 		abort();
 	chan = get_channel(rstate, &scid);
 	if (!chan)
-		chan = new_chan(rstate, &scid, from_id, to_id, satoshis);
+		chan = new_chan(rstate, &scid, from_id, to_id, satoshis, NULL);
 
 	/* Make sure it's seen as initialized (index non-zero). */
 	chan->half[idx].bcast.index = 1;
@@ -161,7 +184,7 @@ int main(void)
 			   strlen("02cca6c5c966fcf61d121e3a70e03a1cd9eeeea024b26ea666ce974d43b242e636"),
 			   &d);
 
-	rstate = new_routing_state(tmpctx, NULL, &a, NULL, NULL, NULL, false, false);
+	rstate = new_routing_state(tmpctx, &a, NULL, NULL, NULL, false, false);
 
 	/* [{'active': True, 'short_id': '6990:2:1/1', 'fee_per_kw': 10, 'delay': 5, 'message_flags': 0, 'channel_flags': 1, 'destination': '0230ad0e74ea03976b28fda587bb75bdd357a1938af4424156a18265167f5e40ae', 'source': '02ea622d5c8d6143f15ed3ce1d501dd0d3d09d3b1c83a44d0034949f8a9ab60f06', 'last_update': 1504064344}, */
 

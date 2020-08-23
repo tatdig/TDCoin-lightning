@@ -18,7 +18,7 @@ and *amount*(\{*destination*: *amount*\}). Its format is like:
 \[\{address1: amount1\}, \{address2: amount2\}\]
 or
 \[\{address: *all*\}\].
-It supports the any number of outputs.
+It supports any number of **confirmed** outputs.
 
 The *destination* of output is the address which can be of any Bitcoin accepted
 type, including bech32.
@@ -76,7 +76,8 @@ Rusty Russell <<rusty@rustcorp.com.au>> is mainly responsible.
 SEE ALSO
 --------
 
-lightning-withdraw(7), lightning-txsend(7), lightning-txdiscard(7)
+lightning-withdraw(7), lightning-txsend(7), lightning-txdiscard(7),
+lightning-feerates(7)
 
 RESOURCES
 ---------

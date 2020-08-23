@@ -6,12 +6,10 @@
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/str/str.h>
 #include <common/amount.h>
+#include <common/bip32.h>
 #include <stdbool.h>
 
-struct bip32_key_version {
-	u32 bip32_pubkey_version;
-	u32 bip32_privkey_version;
-};
+#define ELEMENTS_ASSET_LEN 33
 
 struct chainparams {
 	const char *network_name;
@@ -45,6 +43,12 @@ struct chainparams {
  * chainparams_for_network - Look up blockchain parameters by its name
  */
 const struct chainparams *chainparams_for_network(const char *network_name);
+
+/**
+ * chainparams_for_networks - Get blockchain parameters for all known networks,
+ *                            as a tal array.
+ */
+const struct chainparams **chainparams_for_networks(const tal_t *ctx);
 
 /**
  * chainparams_by_bip173 - Helper to get a network by its bip173 name

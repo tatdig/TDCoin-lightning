@@ -1,168 +1,114 @@
-#include "wire/tlvstream.h"
-#include <assert.h>
+#include <common/bigsize.h>
+#include <wire/tlvstream.h>
 #include <wire/wire.h>
 
-#ifndef SUPERVERBOSE
-#define SUPERVERBOSE(...)
-#endif
-
-static const struct tlv_record_type *
-find_record_type(u64 type,
-		 const struct tlv_record_type types[],
-		 size_t num_types)
+void towire_tlvstream_raw(u8 **pptr, const struct tlv_field *fields)
 {
-	for (size_t i = 0; i < num_types; i++)
-		if (types[i].type == type)
-			return types + i;
-	return NULL;
-}
-
-/* Pull all tlvs from a stream.  Return false and calls fromwire_fail() on
- * error. */
-bool fromwire_tlvs(const u8 **cursor, size_t *max,
-		   const struct tlv_record_type types[],
-		   size_t num_types,
-		   void *record)
-{
-	/* prev_type points to prev_type_store after first iter. */
-	u64 prev_type_store, *prev_type = NULL;
-
-	/* BOLT #1:
-	 *
-	 * The receiving node:
-	 *  - if zero bytes remain before parsing a `type`:
-	 *    - MUST stop parsing the `tlv_stream`.
-	 */
-	while (*max > 0) {
-		u64 type, length;
-		const struct tlv_record_type *rtype;
-
-		/* BOLT #1:
-		 *
-		 * A `varint` is a variable-length, unsigned integer encoding
-		 * using the [BigSize](#appendix-a-bigsize-test-vectors)
-		 * format
-		 */
-		type = fromwire_bigsize(cursor, max);
-
-		/* BOLT #1:
-		 *  - if a `type` or `length` is not minimally encoded:
-		 *    - MUST fail to parse the `tlv_stream`.
-		 */
-		if (!*cursor) {
-			SUPERVERBOSE("type");
-			goto fail;
-		}
-		length = fromwire_bigsize(cursor, max);
-
-		/* BOLT #1:
-		 *  - if a `type` or `length` is not minimally encoded:
-		 *    - MUST fail to parse the `tlv_stream`.
-		 */
-		if (!*cursor) {
-			SUPERVERBOSE("length");
-			goto fail;
-		}
-
-		/* BOLT #1:
-		 *  - if `length` exceeds the number of bytes remaining in the
-		 *    message:
-		 *    - MUST fail to parse the `tlv_stream`.
-		 */
-		if (length > *max) {
-			SUPERVERBOSE("value");
-			goto fail;
-		}
-
-		/* BOLT #1:
-		 *  - if decoded `type`s are not monotonically-increasing:
-		 *    - MUST fail to parse the `tlv_stream`.
-		 */
-		if (prev_type && type <= *prev_type) {
-			if (type == *prev_type)
-				SUPERVERBOSE("duplicate tlv type");
-			else
-				SUPERVERBOSE("invalid ordering");
-			goto fail;
-		}
-
-		/* BOLT #1:
-		 * - if `type` is known:
-		 *   - MUST decode the next `length` bytes using the known
-		 *     encoding for `type`.
-		 */
-		rtype = find_record_type(type, types, num_types);
-		if (rtype) {
-			/* Length of message can't exceed 16 bits anyway. */
-			size_t tlvlen = length;
-			rtype->fromwire(cursor, &tlvlen, record);
-
-			if (!*cursor)
-				goto fail;
-
-			/* BOLT #1:
-			 *  - if `length` is not exactly equal to that required
-			 *    for the known encoding for `type`:
-			 *    - MUST fail to parse the `tlv_stream`.
-			 */
-			if (tlvlen != 0) {
-				SUPERVERBOSE("greater than encoding length");
-				goto fail;
-			}
-
-			/* We've read bytes in ->fromwire, so update max */
-			*max -= length;
-		} else {
-			/* BOLT #1:
-			 * - otherwise, if `type` is unknown:
-			 *   - if `type` is even:
-			 *     - MUST fail to parse the `tlv_stream`.
-			 *   - otherwise, if `type` is odd:
-			 *     - MUST discard the next `length` bytes.
-			 */
-			if (type & 1)
-				fromwire(cursor, max, NULL, length);
-			else {
-				SUPERVERBOSE("unknown even");
-				goto fail;
-			}
-		}
-		prev_type = &prev_type_store;
-		*prev_type = type;
-	}
-	return true;
-
-fail:
-	fromwire_fail(cursor, max);
-	return false;
-}
-
-/* Append a stream of tlvs. */
-void towire_tlvs(u8 **pptr,
-		 const struct tlv_record_type types[],
-		 size_t num_types,
-		 const void *record)
-{
-	if (!record)
+	if (!fields)
 		return;
 
-	for (size_t i = 0; i < num_types; i++) {
-		u8 *val;
-		if (i != 0)
-			assert(types[i].type > types[i-1].type);
-		val = types[i].towire(NULL, record);
-		if (!val)
-			continue;
-
+	for (size_t i = 0; i < tal_count(fields); i++) {
+		const struct tlv_field *field = &fields[i];
 		/* BOLT #1:
 		 *
 		 * The sending node:
 		 ...
 		 *  - MUST minimally encode `type` and `length`.
 		 */
-		towire_bigsize(pptr, types[i].type);
-		towire_bigsize(pptr, tal_bytelen(val));
-		towire(pptr, val, tal_bytelen(val));
-		tal_free(val);
+		towire_bigsize(pptr, field->numtype);
+		towire_bigsize(pptr, field->length);
+		towire(pptr, field->value, field->length);
 	}
+}
+
+static struct tlv_field *tlvstream_get_raw(struct tlv_field *stream, u64 type)
+{
+	for (size_t i=0; i<tal_count(stream); i++)
+		if (stream[i].numtype == type)
+			return &stream[i];
+	return NULL;
+}
+
+void tlvstream_set_raw(struct tlv_field **stream, u64 type, void *value, size_t valuelen)
+{
+	struct tlv_field f, *e = tlvstream_get_raw(*stream, type);
+
+	if (e != NULL) {
+		tal_free(e->value);
+		e->length = valuelen;
+		e->value = tal_dup_arr(*stream, u8, value, e->length, 0);
+	} else {
+		/* If we haven't found it insert it insead. */
+		f.length = valuelen;
+		f.numtype = type;
+		f.value = tal_dup_arr(*stream, u8, value, f.length, 0);
+		tal_arr_expand(stream, f);
+	}
+}
+
+void tlvstream_set_short_channel_id(struct tlv_field **stream, u64 type,
+				    struct short_channel_id *value)
+{
+	u8 *ser = tal_arr(NULL, u8, 0);
+	towire_short_channel_id(&ser, value);
+	tlvstream_set_raw(stream, type, ser, tal_bytelen(ser));
+}
+
+void tlvstream_set_tu64(struct tlv_field **stream, u64 type, u64 value)
+{
+	u8 *ser = tal_arr(NULL, u8, 0);
+	towire_tu64(&ser, value);
+	tlvstream_set_raw(stream, type, ser, tal_bytelen(ser));
+}
+
+void tlvstream_set_tu32(struct tlv_field **stream, u64 type, u32 value)
+{
+	u8 *ser = tal_arr(NULL, u8, 0);
+	towire_tu64(&ser, value);
+	tlvstream_set_raw(stream, type, ser, tal_bytelen(ser));
+}
+
+bool tlvstream_get_short_channel_id(struct tlv_field *stream, u64 type,
+				    struct short_channel_id *value)
+{
+	struct tlv_field *raw = tlvstream_get_raw(stream, type);
+	const u8 *v;
+	size_t max;
+	if (raw == NULL || raw->length != 8)
+		return false;
+
+	max = raw->length;
+	v = raw->value;
+	fromwire_short_channel_id(&v, &max, value);
+
+	return true;
+}
+
+bool tlvstream_get_tu64(struct tlv_field *stream, u64 type, u64 *value)
+{
+	struct tlv_field *raw = tlvstream_get_raw(stream, type);
+	const u8 *v;
+	size_t max;
+	if (raw == NULL || raw->length != 8)
+		return false;
+
+	max = raw->length;
+	v = raw->value;
+	*value = fromwire_tu64(&v, &max);
+
+	return true;
+}
+
+bool tlvstream_get_tu32(struct tlv_field *stream, u64 type, u32 *value)
+{
+	struct tlv_field *raw = tlvstream_get_raw(stream, type);
+	const u8 *v;
+	size_t max;
+	if (raw == NULL || raw->length != 8)
+		return false;
+
+	max = raw->length;
+	v = raw->value;
+	*value = fromwire_tu64(&v, &max);
+	return true;
 }

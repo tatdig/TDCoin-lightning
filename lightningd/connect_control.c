@@ -2,9 +2,11 @@
 #include <ccan/fdpass/fdpass.h>
 #include <ccan/list/list.h>
 #include <ccan/tal/str/str.h>
+#include <common/errcode.h>
 #include <common/features.h>
 #include <common/json_command.h>
 #include <common/json_helpers.h>
+#include <common/json_stream.h>
 #include <common/jsonrpc_errors.h>
 #include <common/memleak.h>
 #include <common/node_id.h>
@@ -20,7 +22,6 @@
 #include <lightningd/connect_control.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/json.h>
-#include <lightningd/json_stream.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
@@ -67,10 +68,11 @@ static struct connect *find_connect(struct lightningd *ld,
 }
 
 static struct command_result *connect_cmd_succeed(struct command *cmd,
-						  const struct node_id *id)
+						  const struct peer *peer)
 {
 	struct json_stream *response = json_stream_success(cmd);
-	json_add_node_id(response, "id", id);
+	json_add_node_id(response, "id", &peer->id);
+	json_add_hex_talarr(response, "features", peer->their_features);
 	return command_success(cmd, response);
 }
 
@@ -138,7 +140,7 @@ static struct command_result *json_connect(struct command *cmd,
 
 		if (peer->uncommitted_channel
 		    || (channel && channel->connected)) {
-			return connect_cmd_succeed(cmd, &id);
+			return connect_cmd_succeed(cmd, peer);
 		}
 	}
 
@@ -231,13 +233,14 @@ void delay_then_reconnect(struct channel *channel, u32 seconds_delay,
 static void connect_failed(struct lightningd *ld, const u8 *msg)
 {
 	struct node_id id;
-	char *err;
+	errcode_t errcode;
+	char *errmsg;
 	struct connect *c;
 	u32 seconds_to_delay;
 	struct wireaddr_internal *addrhint;
 	struct channel *channel;
 
-	if (!fromwire_connectctl_connect_failed(tmpctx, msg, &id, &err,
+	if (!fromwire_connectctl_connect_failed(tmpctx, msg, &id, &errcode, &errmsg,
 						&seconds_to_delay, &addrhint))
 		fatal("Connect gave bad CONNECTCTL_CONNECT_FAILED message %s",
 		      tal_hex(msg, msg));
@@ -245,7 +248,7 @@ static void connect_failed(struct lightningd *ld, const u8 *msg)
 	/* We can have multiple connect commands: fail them all */
 	while ((c = find_connect(ld, &id)) != NULL) {
 		/* They delete themselves from list */
-		was_pending(command_fail(c->cmd, LIGHTNINGD, "%s", err));
+		was_pending(command_fail(c->cmd, errcode, "%s", errmsg));
 	}
 
 	/* If we have an active channel, then reconnect. */
@@ -254,14 +257,14 @@ static void connect_failed(struct lightningd *ld, const u8 *msg)
 		delay_then_reconnect(channel, seconds_to_delay, addrhint);
 }
 
-void connect_succeeded(struct lightningd *ld, const struct node_id *id)
+void connect_succeeded(struct lightningd *ld, const struct peer *peer)
 {
 	struct connect *c;
 
 	/* We can have multiple connect commands: fail them all */
-	while ((c = find_connect(ld, id)) != NULL) {
+	while ((c = find_connect(ld, &peer->id)) != NULL) {
 		/* They delete themselves from list */
-		connect_cmd_succeed(c->cmd, id);
+		connect_cmd_succeed(c->cmd, peer);
 	}
 }
 
@@ -361,7 +364,9 @@ int connectd_init(struct lightningd *ld)
 	}
 
 	msg = towire_connectctl_init(
-	    tmpctx, &ld->id,
+	    tmpctx, chainparams,
+	    ld->our_features,
+	    &ld->id,
 	    wireaddrs,
 	    listen_announce,
 	    ld->proxyaddr, ld->use_proxy_always || ld->pure_tor_setup,

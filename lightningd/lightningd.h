@@ -4,11 +4,14 @@
 #include <bitcoin/chainparams.h>
 #include <bitcoin/privkey.h>
 #include <ccan/container_of/container_of.h>
+#include <ccan/strmap/strmap.h>
 #include <ccan/time/time.h>
 #include <ccan/timer/timer.h>
 #include <lightningd/htlc_end.h>
+#include <lightningd/htlc_set.h>
 #include <lightningd/plugin.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <wallet/txfilter.h>
 #include <wallet/wallet.h>
 
@@ -29,9 +32,6 @@ struct config {
 	/* Minimum percent of fee rate we'll accept. */
 	u32 commitment_fee_min_percent;
 
-	/* Percent of fee rate we'll use. */
-	u32 commitment_fee_percent;
-
 	/* Minimum CLTV to subtract from incoming HTLCs to outgoing */
 	u32 cltv_expiry_delta;
 
@@ -48,7 +48,7 @@ struct config {
 	/* How long between changing commit and sending COMMIT message. */
 	u32 commit_time_ms;
 
-	/* Do we let the funder set any fee rate they want */
+	/* Do we let the opener set any fee rate they want */
 	bool ignore_fee_limits;
 
 	/* Number of blocks to rescan from the current head, or absolute
@@ -58,21 +58,24 @@ struct config {
 	/* ipv6 bind disable */
 	bool no_ipv6_bind;
 
-	/* Accept fee changes only if they are in the range our_fee -
-	 * our_fee*multiplier */
-	u32 max_fee_multiplier;
-
 	/* Are we allowed to use DNS lookup for peers. */
 	bool use_dns;
 
 	/* Minimal amount of effective funding_satoshis for accepting channels */
 	u64 min_capacity_sat;
 
-	/* Allow to define the default behavior of tot services calls*/
+	/* Allow to define the default behavior of tor services calls*/
 	bool use_v3_autotor;
 
 	/* This is the key we use to encrypt `hsm_secret`. */
 	struct secret *keypass;
+};
+
+typedef STRMAP(const char *) alt_subdaemon_map;
+
+enum lightningd_state {
+	LD_STATE_RUNNING,
+	LD_STATE_SHUTDOWN,
 };
 
 struct lightningd {
@@ -85,11 +88,13 @@ struct lightningd {
 
 	int pid_fd;
 
-	/* Our config dir, and rpc file */
-	char *config_dir;
+	/* Our config basedir, network directory, and rpc file */
+	char *config_basedir, *config_netdir;
 
 	/* Location of the RPC socket. */
 	char *rpc_filename;
+	/* Mode of the RPC filename. */
+	mode_t rpc_filemode;
 
 	/* The root of the jsonrpc interface. Can be shut down
 	 * separately from the rest of the daemon to allow a clean
@@ -110,6 +115,9 @@ struct lightningd {
 
 	/* This is us. */
 	struct node_id id;
+
+	/* Feature set we offer. */
+	struct feature_set *our_features;
 
 	/* My name is... my favorite color is... */
 	u8 *alias; /* At least 32 bytes (zero-filled) */
@@ -162,6 +170,9 @@ struct lightningd {
 	struct htlc_in_map htlcs_in;
 	struct htlc_out_map htlcs_out;
 
+	/* Sets of HTLCs we are holding onto for MPP. */
+	struct htlc_set_map htlc_sets;
+
 	struct wallet *wallet;
 
 	/* Outstanding waitsendpay commands. */
@@ -186,15 +197,15 @@ struct lightningd {
 	 * if we are the fundee. */
 	u32 max_funding_unconfirmed;
 
-	/* If we want to debug a subdaemon/plugin. */
-	const char *dev_debug_subprocess;
-
 	/* RPC which asked us to shutdown, if non-NULL */
 	struct io_conn *stop_conn;
 	/* RPC response to send once we've shut down. */
 	const char *stop_response;
 
 #if DEVELOPER
+	/* If we want to debug a subdaemon/plugin. */
+	const char *dev_debug_subprocess;
+
 	/* If we have a --dev-disconnect file */
 	int dev_disconnect_fd;
 
@@ -223,6 +234,14 @@ struct lightningd {
 	/* These are the forced channel secrets for the node. */
 	struct secrets *dev_force_channel_secrets;
 	struct sha256 *dev_force_channel_secrets_shaseed;
+
+	struct channel_id *dev_force_tmp_channel_id;
+
+	/* For slow tests (eg protocol tests) don't die if HTLC not
+	 * committed in 30 secs */
+	bool dev_no_htlc_timeout;
+
+	bool dev_no_version_checks;
 #endif /* DEVELOPER */
 
 	/* tor support */
@@ -239,18 +258,45 @@ struct lightningd {
 	char *wallet_dsn;
 
 	bool encrypted_hsm;
+
+	mode_t initial_umask;
+
+	/* Outstanding waitblockheight commands.  */
+	struct list_head waitblockheight_commands;
+
+	alt_subdaemon_map alt_subdaemons;
+
+	enum lightningd_state state;
+
+	/* Total number of coin moves we've seen, since
+	 * coin move tracking was cool */
+	s64 coin_moves_count;
+
+	/* If non-NULL, contains the exit code to use.  */
+	int *exit_code;
 };
 
 /* Turning this on allows a tal allocation to return NULL, rather than aborting.
  * Use only on carefully tested code! */
 extern bool tal_oom_ok;
 
-const struct chainparams *get_chainparams(const struct lightningd *ld);
+/* Returns true if called with a recognized subdaemon, eg: "hsmd" */
+bool is_subdaemon(const char *sdname);
+
+/* Returns the path to the subdaemon. Considers alternate subdaemon paths. */
+const char *subdaemon_path(const tal_t *ctx, const struct lightningd *ld, const char *name);
 
 /* Check we can run subdaemons, and check their versions */
 void test_subdaemons(const struct lightningd *ld);
 
 /* Notify lightningd about new blocks. */
 void notify_new_block(struct lightningd *ld, u32 block_height);
+
+/* Signal a clean exit from lightningd.
+ * NOTE! This function **returns**.
+ * This just causes the main loop to exit, so you have to return
+ * all the way to the main loop for `lightningd` to exit.
+ */
+void lightningd_exit(struct lightningd *ld, int exit_code);
 
 #endif /* LIGHTNING_LIGHTNINGD_LIGHTNINGD_H */

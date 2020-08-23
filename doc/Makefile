@@ -12,16 +12,23 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-checkmessage.7 \
 	doc/lightning-close.7 \
 	doc/lightning-connect.7 \
+	doc/lightning-createonion.7 \
 	doc/lightning-decodepay.7 \
 	doc/lightning-delexpiredinvoice.7 \
 	doc/lightning-delinvoice.7 \
+	doc/lightning-dev-sendcustommsg.7 \
 	doc/lightning-disconnect.7 \
+	doc/lightning-feerates.7 \
 	doc/lightning-fundchannel.7 \
 	doc/lightning-fundchannel_start.7 \
 	doc/lightning-fundchannel_complete.7 \
 	doc/lightning-fundchannel_cancel.7 \
+	doc/lightning-fundpsbt.7 \
 	doc/lightning-getroute.7 \
+	doc/lightning-getsharedsecret.7 \
+	doc/lightning-hsmtool.8 \
 	doc/lightning-invoice.7 \
+	doc/lightning-keysend.7 \
 	doc/lightning-listchannels.7 \
 	doc/lightning-listforwards.7 \
 	doc/lightning-listfunds.7 \
@@ -32,16 +39,21 @@ MANPAGES := doc/lightning-cli.1 \
 	doc/lightning-newaddr.7 \
 	doc/lightning-pay.7 \
 	doc/lightning-plugin.7 \
+	doc/lightning-reserveinputs.7 \
+	doc/lightning-sendonion.7 \
 	doc/lightning-sendpay.7 \
 	doc/lightning-setchannelfee.7 \
 	doc/lightning-signmessage.7 \
 	doc/lightning-txprepare.7 \
 	doc/lightning-txdiscard.7 \
 	doc/lightning-txsend.7 \
+	doc/lightning-unreserveinputs.7 \
+	doc/lightning-utxopsbt.7 \
 	doc/lightning-waitinvoice.7 \
 	doc/lightning-waitanyinvoice.7 \
+	doc/lightning-waitblockheight.7 \
 	doc/lightning-waitsendpay.7 \
-	doc/lightning-withdraw.7 
+	doc/lightning-withdraw.7
 
 doc-all: $(MANPAGES) doc/index.rst
 
@@ -93,6 +105,6 @@ doc-clean:
 	$(RM) doc/deployable-lightning.{aux,bbl,blg,dvi,log,out,tex}
 
 doc/index.rst:
-	(grep -v '^   lightning.*\.[0-9]\.md>$$' $@; for m in $$(cd doc && echo "$$(ls lightningd*.[0-9].md | sort)\n$$(ls lightning-*.[0-9].md | sort)"); do echo "   $$(echo $$m | sed 's/.[0-9].md//') <$$m>"; done) > $@.tmp.$$$$ && mv $@.tmp.$$$$ $@
+	(grep -v '^   lightning.*\.[0-9]\.md>$$' $@; for m in $$(cd doc && ls lightningd*.[0-9].md lightning-*.[0-9].md); do echo "   $${m%.[0-9].md} <$$m>"; done |$(SORT)) > $@.tmp.$$$$ && mv $@.tmp.$$$$ $@
 
 .PHONY: doc/index.rst

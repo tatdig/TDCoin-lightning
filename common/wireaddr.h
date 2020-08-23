@@ -3,7 +3,6 @@
 #include "config.h"
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
-#include <lightningd/lightningd.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -43,6 +42,8 @@ struct sockaddr_un;
 #define	TOR_V2_ADDRLEN 10
 #define	TOR_V3_ADDRLEN 35
 #define	LARGEST_ADDRLEN TOR_V3_ADDRLEN
+#define	TOR_V3_BLOBLEN 64
+#define	STATIC_TOR_MAGIC_STRING "gen-default-toraddress"
 
 enum wire_addr_type {
 	ADDR_TYPE_IPV4 = 1,
@@ -88,7 +89,7 @@ char *fmt_wireaddr_without_port(const tal_t *ctx, const struct wireaddr *a);
  * we wanted to do a DNS lookup. */
 struct wireaddr *
 wireaddr_from_hostname(const tal_t *ctx,
-                       const char *hostname,
+		       const char *hostname,
                        const u16 port, bool *no_dns,
                        struct sockaddr *broken_reply,
                        const char **err_msg);
@@ -110,6 +111,7 @@ enum wireaddr_internal_type {
 	ADDR_INTERNAL_AUTOTOR,
 	ADDR_INTERNAL_FORPROXY,
 	ADDR_INTERNAL_WIREADDR,
+	ADDR_INTERNAL_STATICTOR,
 };
 
 /* For internal use, where we can also supply a local socket, wildcard. */
@@ -120,8 +122,13 @@ struct wireaddr_internal {
 		struct wireaddr wireaddr;
 		/* ADDR_INTERNAL_ALLPROTO */
 		u16 port;
-		/* ADDR_INTERNAL_AUTOTOR */
-		struct wireaddr torservice;
+		/* ADDR_INTERNAL_AUTOTOR
+		 * ADDR_INTERNAL_STATICTOR */
+		struct torservice {
+			struct wireaddr address;
+			u16 port;
+			u8 blob[TOR_V3_BLOBLEN + 1];
+		} torservice;
 		/* ADDR_INTERNAL_FORPROXY */
 		struct unresolved {
 			char name[256];

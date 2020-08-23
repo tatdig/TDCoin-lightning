@@ -27,6 +27,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <wallet/db.h>
+#include <wire/gen_common_wire.h>
 #include <wire/wire_io.h>
 
 static bool move_fd(int from, int to)
@@ -135,9 +136,11 @@ static void close_taken_fds(va_list *ap)
 }
 
 /* We use sockets, not pipes, because fds are bidir. */
-static int subd(const char *dir, const char *name,
+static int subd(const char *path, const char *name,
 		const char *debug_subdaemon,
-		int *msgfd, int dev_disconnect_fd, va_list *ap)
+		int *msgfd, int dev_disconnect_fd,
+		bool io_logging,
+		va_list *ap)
 {
 	int childmsg[2], execfail[2];
 	pid_t childpid;
@@ -161,7 +164,7 @@ static int subd(const char *dir, const char *name,
 		int fdnum = 3, i, stdin_is_now = STDIN_FILENO;
 		long max;
 		size_t num_args;
-		char *args[] = { NULL, NULL, NULL, NULL };
+		char *args[] = { NULL, NULL, NULL, NULL, NULL };
 
 		close(childmsg[0]);
 		close(execfail[0]);
@@ -199,7 +202,9 @@ static int subd(const char *dir, const char *name,
 				close(i);
 
 		num_args = 0;
-		args[num_args++] = path_join(NULL, dir, name);
+		args[num_args++] = tal_strdup(NULL, path);
+		if (io_logging)
+			args[num_args++] = "--log-io";
 #if DEVELOPER
 		if (dev_disconnect_fd != -1)
 			args[num_args++] = tal_fmt(NULL, "--dev-disconnect=%i", dev_disconnect_fd);
@@ -432,7 +437,7 @@ static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 	switch ((enum status)type) {
 	case WIRE_STATUS_LOG:
 	case WIRE_STATUS_IO:
-		if (!log_status_msg(sd->log, sd->msg_in))
+		if (!log_status_msg(sd->log, sd->node_id, sd->msg_in))
 			goto malformed;
 		goto next;
 	case WIRE_STATUS_FAIL:
@@ -601,6 +606,7 @@ static struct io_plan *msg_setup(struct io_conn *conn, struct subd *sd)
 static struct subd *new_subd(struct lightningd *ld,
 			     const char *name,
 			     void *channel,
+			     const struct node_id *node_id,
 			     struct log *base_log,
 			     bool talks_to_peer,
 			     const char *(*msgname)(int msgtype),
@@ -621,30 +627,44 @@ static struct subd *new_subd(struct lightningd *ld,
 	int msg_fd;
 	const char *debug_subd = NULL;
 	int disconnect_fd = -1;
+	const char *shortname;
 
 	assert(name != NULL);
+
+	/* This part of the name is a bit redundant for logging */
+	if (strstarts(name, "lightning_"))
+		shortname = name + strlen("lightning_");
+	else
+		shortname = name;
+
+	if (base_log) {
+		sd->log = new_log(sd, ld->log_book, node_id,
+				  "%s-%s", shortname, log_prefix(base_log));
+	} else {
+		sd->log = new_log(sd, ld->log_book, node_id, "%s", shortname);
+	}
 
 #if DEVELOPER
 	debug_subd = ld->dev_debug_subprocess;
 	disconnect_fd = ld->dev_disconnect_fd;
 #endif /* DEVELOPER */
 
-	sd->pid = subd(ld->daemon_dir, name, debug_subd,
-		       &msg_fd, disconnect_fd, ap);
+	const char *path = subdaemon_path(tmpctx, ld, name);
+
+	sd->pid = subd(path, name, debug_subd,
+		       &msg_fd, disconnect_fd,
+		       /* We only turn on subdaemon io logging if we're going
+			* to print it: too stressful otherwise! */
+		       log_print_level(sd->log) < LOG_DBG,
+		       ap);
 	if (sd->pid == (pid_t)-1) {
 		log_unusual(ld->log, "subd %s failed: %s",
 			    name, strerror(errno));
 		return tal_free(sd);
 	}
 	sd->ld = ld;
-	if (base_log) {
-		sd->log = new_log(sd, get_log_book(base_log), "%s-%s", name,
-				  log_prefix(base_log));
-	} else {
-		sd->log = new_log(sd, ld->log_book, "%s(%u):", name, sd->pid);
-	}
 
-	sd->name = name;
+	sd->name = shortname;
 	sd->must_not_exit = false;
 	sd->talks_to_peer = talks_to_peer;
 	sd->msgname = msgname;
@@ -658,12 +678,16 @@ static struct subd *new_subd(struct lightningd *ld,
 	tal_add_destructor(sd, destroy_subd);
 	list_head_init(&sd->reqs);
 	sd->channel = channel;
+	if (node_id)
+		sd->node_id = tal_dup(sd, struct node_id, node_id);
+	else
+		sd->node_id = NULL;
 
 	/* conn actually owns daemon: we die when it does. */
 	sd->conn = io_new_conn(ld, msg_fd, msg_setup, sd);
 	tal_steal(sd->conn, sd);
 
-	log_debug(sd->log, "pid %u, msgfd %i", sd->pid, msg_fd);
+	log_peer_debug(sd->log, node_id, "pid %u, msgfd %i", sd->pid, msg_fd);
 
 	/* Clear any old transient message. */
 	if (billboardcb)
@@ -682,7 +706,7 @@ struct subd *new_global_subd(struct lightningd *ld,
 	struct subd *sd;
 
 	va_start(ap, msgcb);
-	sd = new_subd(ld, name, NULL, NULL, false, msgname, msgcb, NULL, NULL, &ap);
+	sd = new_subd(ld, name, NULL, NULL, NULL, false, msgname, msgcb, NULL, NULL, &ap);
 	va_end(ap);
 
 	sd->must_not_exit = true;
@@ -692,6 +716,7 @@ struct subd *new_global_subd(struct lightningd *ld,
 struct subd *new_channel_subd_(struct lightningd *ld,
 			       const char *name,
 			       void *channel,
+			       const struct node_id *node_id,
 			       struct log *base_log,
 			       bool talks_to_peer,
 			       const char *(*msgname)(int msgtype),
@@ -711,17 +736,19 @@ struct subd *new_channel_subd_(struct lightningd *ld,
 	struct subd *sd;
 
 	va_start(ap, billboardcb);
-	sd = new_subd(ld, name, channel, base_log, talks_to_peer, msgname,
-		      msgcb, errcb, billboardcb, &ap);
+	sd = new_subd(ld, name, channel, node_id, base_log, talks_to_peer,
+		      msgname, msgcb, errcb, billboardcb, &ap);
 	va_end(ap);
 	return sd;
 }
 
 void subd_send_msg(struct subd *sd, const u8 *msg_out)
 {
+	u16 type = fromwire_peektype(msg_out);
 	/* FIXME: We should use unique upper bits for each daemon, then
 	 * have generate-wire.py add them, just assert here. */
-	assert(!strstarts(sd->msgname(fromwire_peektype(msg_out)), "INVALID"));
+	assert(!strstarts(common_wire_type_name(type), "INVALID") ||
+	       !strstarts(sd->msgname(type), "INVALID"));
 	msg_enqueue(sd->outq, msg_out);
 }
 

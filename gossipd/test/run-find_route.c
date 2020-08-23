@@ -1,8 +1,11 @@
 #include "../routing.c"
 #include "../gossip_store.c"
+#include <common/json_stream.h>
 #include <stdio.h>
 
-void status_fmt(enum log_level level UNUSED, const char *fmt, ...)
+void status_fmt(enum log_level level UNUSED,
+		const struct node_id *node_id,
+		const char *fmt, ...)
 {
 	va_list ap;
 
@@ -18,18 +21,43 @@ bool cupdate_different(struct gossip_store *gs UNNEEDED,
 		       const struct half_chan *hc UNNEEDED,
 		       const u8 *cupdate UNNEEDED)
 { fprintf(stderr, "cupdate_different called!\n"); abort(); }
-/* Generated stub for fromwire_gossipd_local_add_channel */
-bool fromwire_gossipd_local_add_channel(const void *p UNNEEDED, struct short_channel_id *short_channel_id UNNEEDED, struct node_id *remote_node_id UNNEEDED, struct amount_sat *satoshis UNNEEDED)
-{ fprintf(stderr, "fromwire_gossipd_local_add_channel called!\n"); abort(); }
+/* Generated stub for fmt_wireaddr_without_port */
+char *fmt_wireaddr_without_port(const tal_t *ctx UNNEEDED, const struct wireaddr *a UNNEEDED)
+{ fprintf(stderr, "fmt_wireaddr_without_port called!\n"); abort(); }
 /* Generated stub for fromwire_gossip_store_channel_amount */
 bool fromwire_gossip_store_channel_amount(const void *p UNNEEDED, struct amount_sat *satoshis UNNEEDED)
 { fprintf(stderr, "fromwire_gossip_store_channel_amount called!\n"); abort(); }
 /* Generated stub for fromwire_gossip_store_private_update */
 bool fromwire_gossip_store_private_update(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, u8 **update UNNEEDED)
 { fprintf(stderr, "fromwire_gossip_store_private_update called!\n"); abort(); }
+/* Generated stub for fromwire_gossipd_local_add_channel */
+bool fromwire_gossipd_local_add_channel(const tal_t *ctx UNNEEDED, const void *p UNNEEDED, struct short_channel_id *short_channel_id UNNEEDED, struct node_id *remote_node_id UNNEEDED, struct amount_sat *satoshis UNNEEDED, u8 **features UNNEEDED)
+{ fprintf(stderr, "fromwire_gossipd_local_add_channel called!\n"); abort(); }
 /* Generated stub for fromwire_wireaddr */
 bool fromwire_wireaddr(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, struct wireaddr *addr UNNEEDED)
 { fprintf(stderr, "fromwire_wireaddr called!\n"); abort(); }
+/* Generated stub for json_add_member */
+void json_add_member(struct json_stream *js UNNEEDED,
+		     const char *fieldname UNNEEDED,
+		     bool quote UNNEEDED,
+		     const char *fmt UNNEEDED, ...)
+{ fprintf(stderr, "json_add_member called!\n"); abort(); }
+/* Generated stub for json_array_end */
+void json_array_end(struct json_stream *js UNNEEDED)
+{ fprintf(stderr, "json_array_end called!\n"); abort(); }
+/* Generated stub for json_array_start */
+void json_array_start(struct json_stream *js UNNEEDED, const char *fieldname UNNEEDED)
+{ fprintf(stderr, "json_array_start called!\n"); abort(); }
+/* Generated stub for json_member_direct */
+char *json_member_direct(struct json_stream *js UNNEEDED,
+			 const char *fieldname UNNEEDED, size_t extra UNNEEDED)
+{ fprintf(stderr, "json_member_direct called!\n"); abort(); }
+/* Generated stub for json_object_end */
+void json_object_end(struct json_stream *js UNNEEDED)
+{ fprintf(stderr, "json_object_end called!\n"); abort(); }
+/* Generated stub for json_object_start */
+void json_object_start(struct json_stream *ks UNNEEDED, const char *fieldname UNNEEDED)
+{ fprintf(stderr, "json_object_start called!\n"); abort(); }
 /* Generated stub for memleak_add_helper_ */
 void memleak_add_helper_(const tal_t *p UNNEEDED, void (*cb)(struct htable *memtable UNNEEDED,
 						    const tal_t *)){ }
@@ -41,9 +69,6 @@ bool nannounce_different(struct gossip_store *gs UNNEEDED,
 /* Generated stub for notleak_ */
 void *notleak_(const void *ptr UNNEEDED, bool plus_children UNNEEDED)
 { fprintf(stderr, "notleak_ called!\n"); abort(); }
-/* Generated stub for onion_type_name */
-const char *onion_type_name(int e UNNEEDED)
-{ fprintf(stderr, "onion_type_name called!\n"); abort(); }
 /* Generated stub for peer_supplied_good_gossip */
 void peer_supplied_good_gossip(struct peer *peer UNNEEDED, size_t amount UNNEEDED)
 { fprintf(stderr, "peer_supplied_good_gossip called!\n"); abort(); }
@@ -114,7 +139,7 @@ static void add_connection(struct routing_state *rstate,
 
 	chan = get_channel(rstate, &scid);
 	if (!chan)
-		chan = new_chan(rstate, &scid, from, to, satoshis);
+		chan = new_chan(rstate, &scid, from, to, satoshis, NULL);
 
 	c = &chan->half[node_id_idx(from, to)];
 	/* Make sure it's seen as initialized (index non-zero). */
@@ -196,7 +221,7 @@ int main(void)
 
 	memset(&tmp, 'a', sizeof(tmp));
 	node_id_from_privkey(&tmp, &a);
-	rstate = new_routing_state(tmpctx, NULL, &a, NULL, NULL, NULL, false, false);
+	rstate = new_routing_state(tmpctx, &a, NULL, NULL, NULL, false, false);
 
 	new_node(rstate, &a);
 

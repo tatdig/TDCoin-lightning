@@ -5,6 +5,11 @@
 #include <ccan/fdpass/fdpass.h>
 #include <ccan/io/io.h>
 #include <ccan/take/take.h>
+#include <common/ecdh.h>
+#include <common/json.h>
+#include <common/json_helpers.h>
+#include <common/jsonrpc_errors.h>
+#include <common/param.h>
 #include <common/status.h>
 #include <common/utils.h>
 #include <errno.h>
@@ -12,6 +17,8 @@
 #include <inttypes.h>
 #include <lightningd/bitcoind.h>
 #include <lightningd/hsm_control.h>
+#include <lightningd/json.h>
+#include <lightningd/jsonrpc.h>
 #include <lightningd/log.h>
 #include <lightningd/log_status.h>
 #include <string.h>
@@ -77,10 +84,11 @@ static unsigned int hsm_msg(struct subd *hsmd,
 	return 0;
 }
 
-void hsm_init(struct lightningd *ld)
+struct ext_key *hsm_init(struct lightningd *ld)
 {
 	u8 *msg;
 	int fds[2];
+	struct ext_key *bip32_base;
 
 	/* We actually send requests synchronously: only status is async. */
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0)
@@ -105,7 +113,7 @@ void hsm_init(struct lightningd *ld)
 
 	ld->hsm_fd = fds[0];
 	if (!wire_sync_write(ld->hsm_fd, towire_hsm_init(tmpctx,
-							 &ld->topology->bitcoind->chainparams->bip32_key_version,
+							 &chainparams->bip32_key_version,
 							 chainparams,
 							 ld->config.keypass,
 							 IFDEV(ld->dev_force_privkey, NULL),
@@ -114,12 +122,43 @@ void hsm_init(struct lightningd *ld)
 							 IFDEV(ld->dev_force_channel_secrets_shaseed, NULL))))
 		err(1, "Writing init msg to hsm");
 
-	ld->wallet->bip32_base = tal(ld->wallet, struct ext_key);
+	bip32_base = tal(ld, struct ext_key);
 	msg = wire_sync_read(tmpctx, ld->hsm_fd);
 	if (!fromwire_hsm_init_reply(msg,
-				     &ld->id, ld->wallet->bip32_base)) {
+				     &ld->id, bip32_base)) {
 		if (ld->config.keypass)
 			errx(1, "Wrong password for encrypted hsm_secret.");
 		errx(1, "HSM did not give init reply");
 	}
+
+	return bip32_base;
 }
+
+static struct command_result *json_getsharedsecret(struct command *cmd,
+					   const char *buffer,
+					   const jsmntok_t *obj UNNEEDED,
+					   const jsmntok_t *params)
+{
+	struct pubkey *point;
+	struct secret ss;
+	struct json_stream *response;
+
+	if (!param(cmd, buffer, params,
+		   p_req("point", &param_pubkey, &point),
+		   NULL))
+		return command_param_failed();
+
+	ecdh(point, &ss);
+	response = json_stream_success(cmd);
+	json_add_secret(response, "shared_secret", &ss);
+	return command_success(cmd, response);
+}
+
+static const struct json_command getsharedsecret_command = {
+	"getsharedsecret",
+	"utility", /* FIXME: Or "crypto"?  */
+	&json_getsharedsecret,
+	"Compute the hash of the Elliptic Curve Diffie Hellman shared secret point from "
+	"this node private key and an input {point}."
+};
+AUTODATA(json_command, &getsharedsecret_command);

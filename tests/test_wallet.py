@@ -1,9 +1,13 @@
+from bitcoin.rpc import JSONRPCError
 from decimal import Decimal
 from fixtures import *  # noqa: F401,F403
 from fixtures import TEST_NETWORK
 from flaky import flaky  # noqa: F401
-from lightning import RpcError, Millisatoshi
-from utils import only_one, wait_for, sync_blockheight, EXPERIMENTAL_FEATURES, COMPAT, VALGRIND, SLOW_MACHINE
+from pyln.client import RpcError, Millisatoshi
+from utils import (
+    only_one, wait_for, sync_blockheight, EXPERIMENTAL_FEATURES, COMPAT,
+    VALGRIND, check_coin_moves
+)
 
 import os
 import pytest
@@ -143,11 +147,11 @@ def test_withdraw(node_factory, bitcoind):
         l1.rpc.withdraw(waddr, 'all')
 
     # Add some funds to withdraw
-    for i in range(10):
+    for i in range(12):
         l1.bitcoin.rpc.sendtoaddress(addr, amount / 10**8 + 0.01)
 
     bitcoind.generate_block(1)
-    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 10)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 12)
 
     # Try passing in a utxo set
     utxos = [utxo["txid"] + ":" + str(utxo["output"]) for utxo in l1.rpc.listfunds()["outputs"]][:4]
@@ -161,6 +165,16 @@ def test_withdraw(node_factory, bitcoind):
     vins = ["{}:{}".format(v['txid'], v['vout']) for v in decode['vin']]
     for utxo in utxos:
         assert utxo in vins
+
+    # Try passing unconfirmed utxos
+    unconfirmed_utxos = [l1.rpc.withdraw(l1.rpc.newaddr()["bech32"], 10**5)
+                         for _ in range(5)]
+    uutxos = [u["txid"] + ":0" for u in unconfirmed_utxos]
+    l1.rpc.withdraw(waddr, "all", minconf=0, utxos=uutxos)
+
+    # Try passing minimum feerates (for relay)
+    l1.rpc.withdraw(l1.rpc.newaddr()["bech32"], 10**5, feerate="253perkw")
+    l1.rpc.withdraw(l1.rpc.newaddr()["bech32"], 10**5, feerate="1000perkb")
 
 
 def test_minconf_withdraw(node_factory, bitcoind):
@@ -262,6 +276,21 @@ def test_deprecated_txprepare(node_factory, bitcoind):
     l1.rpc.call('txprepare', {'destination': addr, 'satoshi': Millisatoshi(amount * 100)})
 
 
+def test_txprepare_multi(node_factory, bitcoind):
+    amount = 10000000
+    l1 = node_factory.get_node(random_hsm=True)
+
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8)
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 1)
+
+    outputs = []
+    for i in range(9):
+        outputs.append({l1.rpc.newaddr()['bech32']: Millisatoshi(amount * 100)})
+    prep = l1.rpc.txprepare(outputs=outputs)
+    l1.rpc.txdiscard(prep['txid'])
+
+
 def test_txprepare(node_factory, bitcoind, chainparams):
     amount = 1000000
     l1 = node_factory.get_node(random_hsm=True)
@@ -277,7 +306,7 @@ def test_txprepare(node_factory, bitcoind, chainparams):
     bitcoind.generate_block(1)
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 10)
 
-    prep = l1.rpc.txprepare([{addr: Millisatoshi(amount * 3 * 1000)}])
+    prep = l1.rpc.txprepare(outputs=[{addr: Millisatoshi(amount * 3 * 1000)}])
     decode = bitcoind.rpc.decoderawtransaction(prep['unsigned_tx'])
     assert decode['txid'] == prep['txid']
     # 4 inputs, 2 outputs (3 if we have a fee output).
@@ -348,10 +377,18 @@ def test_txprepare(node_factory, bitcoind, chainparams):
     l1.rpc.txdiscard(prep4['txid'])
 
     # Try passing in a utxo set
-    utxos = [utxo["txid"] + ":" + str(utxo["output"]) for utxo in l1.rpc.listfunds()["outputs"]][:4]
-
+    utxos = [utxo["txid"] + ":" + str(utxo["output"])
+             for utxo in l1.rpc.listfunds()["outputs"]][:4]
     prep5 = l1.rpc.txprepare([{addr:
                              Millisatoshi(amount * 3.5 * 1000)}], utxos=utxos)
+
+    # Try passing unconfirmed utxos
+    unconfirmed_utxo = l1.rpc.withdraw(l1.rpc.newaddr()["bech32"], 10**5)
+    uutxos = [unconfirmed_utxo["txid"] + ":0"]
+    with pytest.raises(RpcError, match=r"Cannot afford transaction .* use "
+                       "confirmed utxos."):
+        l1.rpc.txprepare([{addr: Millisatoshi(amount * 3.5 * 1000)}],
+                         utxos=uutxos)
 
     decode = bitcoind.rpc.decoderawtransaction(prep5['unsigned_tx'])
     assert decode['txid'] == prep5['txid']
@@ -397,6 +434,406 @@ def test_txprepare(node_factory, bitcoind, chainparams):
     assert decode['vout'][outnum2]['scriptPubKey']['addresses'] == [addr]
 
     assert decode['vout'][changenum]['scriptPubKey']['type'] == 'witness_v0_keyhash'
+
+
+def test_reserveinputs(node_factory, bitcoind, chainparams):
+    amount = 1000000
+    total_outs = 12
+    l1 = node_factory.get_node(feerates=(7500, 7500, 7500, 7500))
+
+    outputs = []
+    # Add a medley of funds to withdraw later, bech32 + p2sh-p2wpkh
+    for i in range(total_outs // 2):
+        txid = bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'],
+                                          amount / 10**8)
+        outputs.append((txid, bitcoind.rpc.gettransaction(txid)['details'][0]['vout']))
+        txid = bitcoind.rpc.sendtoaddress(l1.rpc.newaddr('p2sh-segwit')['p2sh-segwit'],
+                                          amount / 10**8)
+        outputs.append((txid, bitcoind.rpc.gettransaction(txid)['details'][0]['vout']))
+
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == total_outs)
+
+    assert not any(o['reserved'] for o in l1.rpc.listfunds()['outputs'])
+
+    # Try reserving one at a time.
+    for out in outputs:
+        psbt = bitcoind.rpc.createpsbt([{'txid': out[0], 'vout': out[1]}], [])
+        l1.rpc.reserveinputs(psbt)
+
+    assert all(o['reserved'] for o in l1.rpc.listfunds()['outputs'])
+
+    # Unreserve as a batch.
+    psbt = bitcoind.rpc.createpsbt([{'txid': out[0], 'vout': out[1]} for out in outputs], [])
+    l1.rpc.unreserveinputs(psbt)
+    assert not any(o['reserved'] for o in l1.rpc.listfunds()['outputs'])
+
+    # Reserve twice fails unless exclusive.
+    l1.rpc.reserveinputs(psbt)
+    with pytest.raises(RpcError, match=r"already reserved"):
+        l1.rpc.reserveinputs(psbt)
+    l1.rpc.reserveinputs(psbt, False)
+    l1.rpc.unreserveinputs(psbt)
+    assert all(o['reserved'] for o in l1.rpc.listfunds()['outputs'])
+
+    # Stays reserved across restarts.
+    l1.restart()
+    assert all(o['reserved'] for o in l1.rpc.listfunds()['outputs'])
+
+    # Final unreserve works.
+    l1.rpc.unreserveinputs(psbt)
+    assert not any(o['reserved'] for o in l1.rpc.listfunds()['outputs'])
+
+
+def test_fundpsbt(node_factory, bitcoind, chainparams):
+    amount = 1000000
+    total_outs = 4
+    l1 = node_factory.get_node()
+
+    outputs = []
+    # Add a medley of funds to withdraw later, bech32 + p2sh-p2wpkh
+    for i in range(total_outs // 2):
+        txid = bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'],
+                                          amount / 10**8)
+        outputs.append((txid, bitcoind.rpc.gettransaction(txid)['details'][0]['vout']))
+        txid = bitcoind.rpc.sendtoaddress(l1.rpc.newaddr('p2sh-segwit')['p2sh-segwit'],
+                                          amount / 10**8)
+        outputs.append((txid, bitcoind.rpc.gettransaction(txid)['details'][0]['vout']))
+
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == total_outs)
+
+    feerate = '7500perkw'
+
+    # Should get one input, plus some excess
+    funding = l1.rpc.fundpsbt(amount // 2, feerate, 0, reserve=False)
+    psbt = bitcoind.rpc.decodepsbt(funding['psbt'])
+    # We can fuzz this up to 99 blocks back.
+    assert psbt['tx']['locktime'] > bitcoind.rpc.getblockcount() - 100
+    assert psbt['tx']['locktime'] <= bitcoind.rpc.getblockcount()
+    assert len(psbt['tx']['vin']) == 1
+    assert funding['excess_msat'] > Millisatoshi(0)
+    assert funding['excess_msat'] < Millisatoshi(amount // 2 * 1000)
+    assert funding['feerate_per_kw'] == 7500
+    assert 'estimated_final_weight' in funding
+    assert 'reservations' not in funding
+
+    # This should add 99 to the weight, but otherwise be identical (might choose different inputs though!) except for locktime.
+    funding2 = l1.rpc.fundpsbt(amount // 2, feerate, 99, reserve=False, locktime=bitcoind.rpc.getblockcount() + 1)
+    psbt2 = bitcoind.rpc.decodepsbt(funding2['psbt'])
+    assert psbt2['tx']['locktime'] == bitcoind.rpc.getblockcount() + 1
+    assert len(psbt2['tx']['vin']) == 1
+    assert funding2['excess_msat'] < funding['excess_msat']
+    assert funding2['feerate_per_kw'] == 7500
+    # Naively you'd expect this to be +99, but it might have selected a non-p2sh output...
+    assert funding2['estimated_final_weight'] > funding['estimated_final_weight']
+
+    # Cannot afford this one (too much)
+    with pytest.raises(RpcError, match=r"not afford"):
+        l1.rpc.fundpsbt(amount * total_outs, feerate, 0)
+
+    # Nor this (depth insufficient)
+    with pytest.raises(RpcError, match=r"not afford"):
+        l1.rpc.fundpsbt(amount // 2, feerate, 0, minconf=2)
+
+    # Should get two inputs.
+    psbt = bitcoind.rpc.decodepsbt(l1.rpc.fundpsbt(amount, feerate, 0, reserve=False)['psbt'])
+    assert len(psbt['tx']['vin']) == 2
+
+    # Should not use reserved outputs.
+    psbt = bitcoind.rpc.createpsbt([{'txid': out[0], 'vout': out[1]} for out in outputs], [])
+    l1.rpc.reserveinputs(psbt)
+    with pytest.raises(RpcError, match=r"not afford"):
+        l1.rpc.fundpsbt(amount // 2, feerate, 0)
+
+    # Will use first one if unreserved.
+    l1.rpc.unreserveinputs(bitcoind.rpc.createpsbt([{'txid': outputs[0][0], 'vout': outputs[0][1]}], []))
+    psbt = l1.rpc.fundpsbt(amount // 2, feerate, 0)['psbt']
+
+    # Should have passed to reserveinputs.
+    with pytest.raises(RpcError, match=r"already reserved"):
+        l1.rpc.reserveinputs(psbt)
+
+    # And now we can't afford any more.
+    with pytest.raises(RpcError, match=r"not afford"):
+        l1.rpc.fundpsbt(amount // 2, feerate, 0)
+
+
+def test_utxopsbt(node_factory, bitcoind):
+    amount = 1000000
+    l1 = node_factory.get_node()
+
+    outputs = []
+    # Add a medley of funds to withdraw later, bech32 + p2sh-p2wpkh
+    txid = bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'],
+                                      amount / 10**8)
+    outputs.append((txid, bitcoind.rpc.gettransaction(txid)['details'][0]['vout']))
+    txid = bitcoind.rpc.sendtoaddress(l1.rpc.newaddr('p2sh-segwit')['p2sh-segwit'],
+                                      amount / 10**8)
+    outputs.append((txid, bitcoind.rpc.gettransaction(txid)['details'][0]['vout']))
+
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == len(outputs))
+
+    feerate = '7500perkw'
+
+    # Explicitly spend the first output above.
+    funding = l1.rpc.utxopsbt(amount // 2, feerate, 0,
+                              ['{}:{}'.format(outputs[0][0], outputs[0][1])],
+                              reserve=False)
+    psbt = bitcoind.rpc.decodepsbt(funding['psbt'])
+    # We can fuzz this up to 99 blocks back.
+    assert psbt['tx']['locktime'] > bitcoind.rpc.getblockcount() - 100
+    assert psbt['tx']['locktime'] <= bitcoind.rpc.getblockcount()
+    assert len(psbt['tx']['vin']) == 1
+    assert funding['excess_msat'] > Millisatoshi(0)
+    assert funding['excess_msat'] < Millisatoshi(amount // 2 * 1000)
+    assert funding['feerate_per_kw'] == 7500
+    assert 'estimated_final_weight' in funding
+    assert 'reservations' not in funding
+
+    # This should add 99 to the weight, but otherwise be identical except for locktime.
+    funding2 = l1.rpc.utxopsbt(amount // 2, feerate, 99,
+                               ['{}:{}'.format(outputs[0][0], outputs[0][1])],
+                               reserve=False, locktime=bitcoind.rpc.getblockcount() + 1)
+    psbt2 = bitcoind.rpc.decodepsbt(funding2['psbt'])
+    assert psbt2['tx']['locktime'] == bitcoind.rpc.getblockcount() + 1
+    assert psbt2['tx']['vin'] == psbt['tx']['vin']
+    assert psbt2['tx']['vout'] == psbt['tx']['vout']
+    assert funding2['excess_msat'] < funding['excess_msat']
+    assert funding2['feerate_per_kw'] == 7500
+    assert funding2['estimated_final_weight'] == funding['estimated_final_weight'] + 99
+    assert 'reservations' not in funding2
+
+    # Cannot afford this one (too much)
+    with pytest.raises(RpcError, match=r"not afford"):
+        l1.rpc.utxopsbt(amount, feerate, 0,
+                        ['{}:{}'.format(outputs[0][0], outputs[0][1])])
+
+    # Nor this (even with both)
+    with pytest.raises(RpcError, match=r"not afford"):
+        l1.rpc.utxopsbt(amount * 2, feerate, 0,
+                        ['{}:{}'.format(outputs[0][0], outputs[0][1]),
+                         '{}:{}'.format(outputs[1][0], outputs[1][1])])
+
+    # Should get two inputs (and reserve!)
+    funding = l1.rpc.utxopsbt(amount, feerate, 0,
+                              ['{}:{}'.format(outputs[0][0], outputs[0][1]),
+                               '{}:{}'.format(outputs[1][0], outputs[1][1])])
+    psbt = bitcoind.rpc.decodepsbt(funding['psbt'])
+    assert len(psbt['tx']['vin']) == 2
+    assert len(funding['reservations']) == 2
+    assert funding['reservations'][0]['txid'] == outputs[0][0]
+    assert funding['reservations'][0]['vout'] == outputs[0][1]
+    assert funding['reservations'][0]['was_reserved'] is False
+    assert funding['reservations'][0]['reserved'] is True
+    assert funding['reservations'][1]['txid'] == outputs[1][0]
+    assert funding['reservations'][1]['vout'] == outputs[1][1]
+    assert funding['reservations'][1]['was_reserved'] is False
+    assert funding['reservations'][1]['reserved'] is True
+
+    # Should refuse to use reserved outputs.
+    with pytest.raises(RpcError, match=r"already reserved"):
+        l1.rpc.utxopsbt(amount, feerate, 0,
+                        ['{}:{}'.format(outputs[0][0], outputs[0][1]),
+                         '{}:{}'.format(outputs[1][0], outputs[1][1])])
+
+    # Unless we tell it that's ok.
+    l1.rpc.utxopsbt(amount, feerate, 0,
+                    ['{}:{}'.format(outputs[0][0], outputs[0][1]),
+                     '{}:{}'.format(outputs[1][0], outputs[1][1])],
+                    reservedok=True)
+
+
+def test_sign_and_send_psbt(node_factory, bitcoind, chainparams):
+    """
+    Tests for the sign + send psbt RPCs
+    """
+    amount = 1000000
+    total_outs = 12
+    coin_mvt_plugin = os.path.join(os.getcwd(), 'tests/plugins/coin_movements.py')
+    l1 = node_factory.get_node(options={'plugin': coin_mvt_plugin},
+                               feerates=(7500, 7500, 7500, 7500))
+    l2 = node_factory.get_node()
+    addr = chainparams['example_addr']
+
+    # Add a medley of funds to withdraw later, bech32 + p2sh-p2wpkh
+    for i in range(total_outs // 2):
+        bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'],
+                                   amount / 10**8)
+        bitcoind.rpc.sendtoaddress(l1.rpc.newaddr('p2sh-segwit')['p2sh-segwit'],
+                                   amount / 10**8)
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == total_outs)
+
+    # Make a PSBT out of our inputs
+    funding = l1.rpc.fundpsbt(satoshi=Millisatoshi(3 * amount * 1000),
+                              feerate=7500,
+                              startweight=42,
+                              reserve=True)
+    assert len([x for x in l1.rpc.listfunds()['outputs'] if x['reserved']]) == 4
+    psbt = bitcoind.rpc.decodepsbt(funding['psbt'])
+    saved_input = psbt['tx']['vin'][0]
+
+    # Go ahead and unreserve the UTXOs, we'll use a smaller
+    # set of them to create a second PSBT that we'll attempt to sign
+    # and broadcast (to disastrous results)
+    l1.rpc.unreserveinputs(funding['psbt'])
+
+    # Re-reserve one of the utxos we just unreserved
+    psbt = bitcoind.rpc.createpsbt([{'txid': saved_input['txid'],
+                                     'vout': saved_input['vout']}], [])
+    l1.rpc.reserveinputs(psbt)
+
+    # We require the utxos be reserved before signing them
+    with pytest.raises(RpcError, match=r"Aborting PSBT signing. UTXO .* is not reserved"):
+        l1.rpc.signpsbt(funding['psbt'])['signed_psbt']
+
+    # Now we unreserve the singleton, so we can reserve it again
+    l1.rpc.unreserveinputs(psbt)
+
+    # Now add an output.
+    output_pbst = bitcoind.rpc.createpsbt([],
+                                          [{addr: 3 * amount / 10**8}])
+    fullpsbt = bitcoind.rpc.joinpsbts([funding['psbt'], output_pbst])
+
+    # We re-reserve the first set...
+    l1.rpc.reserveinputs(fullpsbt)
+
+    # Sign + send the PSBT we've created
+    signed_psbt = l1.rpc.signpsbt(fullpsbt)['signed_psbt']
+    broadcast_tx = l1.rpc.sendpsbt(signed_psbt)
+
+    # Check that it was broadcast successfully
+    l1.daemon.wait_for_log(r'sendrawtx exit 0 .* sendrawtransaction {}'.format(broadcast_tx['tx']))
+    bitcoind.generate_block(1)
+
+    # We didn't add a change output.
+    expected_outs = total_outs - 4
+    wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == expected_outs)
+
+    # Let's try *sending* a PSBT that can't be finalized (it's unsigned)
+    with pytest.raises(RpcError, match=r"PSBT not finalizeable"):
+        l1.rpc.sendpsbt(fullpsbt)
+
+    # Now we try signing a PSBT with an output that's already been spent
+    with pytest.raises(RpcError, match=r"Aborting PSBT signing. UTXO .* is not reserved"):
+        l1.rpc.signpsbt(fullpsbt)
+
+    # Queue up another node, to make some PSBTs for us
+    for i in range(total_outs // 2):
+        bitcoind.rpc.sendtoaddress(l2.rpc.newaddr()['bech32'],
+                                   amount / 10**8)
+        bitcoind.rpc.sendtoaddress(l2.rpc.newaddr('p2sh-segwit')['p2sh-segwit'],
+                                   amount / 10**8)
+    # Create a PSBT using L2
+    bitcoind.generate_block(1)
+    wait_for(lambda: len(l2.rpc.listfunds()['outputs']) == total_outs)
+    l2_funding = l2.rpc.fundpsbt(satoshi=Millisatoshi(3 * amount * 1000),
+                                 feerate=7500,
+                                 startweight=42,
+                                 reserve=True)
+
+    # Try to get L1 to sign it
+    with pytest.raises(RpcError, match=r"No wallet inputs to sign"):
+        l1.rpc.signpsbt(l2_funding['psbt'])
+
+    # With signonly it will fail if it can't sign it.
+    with pytest.raises(RpcError, match=r"is unknown"):
+        l1.rpc.signpsbt(l2_funding['psbt'], signonly=[0])
+
+    # Add some of our own PSBT inputs to it
+    l1_funding = l1.rpc.fundpsbt(satoshi=Millisatoshi(3 * amount * 1000),
+                                 feerate=7500,
+                                 startweight=42,
+                                 reserve=True)
+    l1_num_inputs = len(bitcoind.rpc.decodepsbt(l1_funding['psbt'])['tx']['vin'])
+    l2_num_inputs = len(bitcoind.rpc.decodepsbt(l2_funding['psbt'])['tx']['vin'])
+
+    # Join and add an output (reorders!)
+    joint_psbt = bitcoind.rpc.joinpsbts([l1_funding['psbt'], l2_funding['psbt'],
+                                         output_pbst])
+
+    # Ask it to sign inputs it doesn't know, it will fail.
+    with pytest.raises(RpcError, match=r"is unknown"):
+        l1.rpc.signpsbt(joint_psbt,
+                        signonly=list(range(l1_num_inputs + 1)))
+
+    # Similarly, it can't sign inputs it doesn't know.
+    sign_success = []
+    for i in range(l1_num_inputs + l2_num_inputs):
+        try:
+            l1.rpc.signpsbt(joint_psbt, signonly=[i])
+        except RpcError:
+            continue
+        sign_success.append(i)
+    assert len(sign_success) == l1_num_inputs
+
+    # But it can sign all the valid ones at once.
+    half_signed_psbt = l1.rpc.signpsbt(joint_psbt, signonly=sign_success)['signed_psbt']
+    for s in sign_success:
+        assert bitcoind.rpc.decodepsbt(half_signed_psbt)['inputs'][s]['partial_signatures'] is not None
+
+    totally_signed = l2.rpc.signpsbt(half_signed_psbt)['signed_psbt']
+
+    broadcast_tx = l1.rpc.sendpsbt(totally_signed)
+    l1.daemon.wait_for_log(r'sendrawtx exit 0 .* sendrawtransaction {}'.format(broadcast_tx['tx']))
+
+    # Send a PSBT that's not ours
+    l2_funding = l2.rpc.fundpsbt(satoshi=Millisatoshi(3 * amount * 1000),
+                                 feerate=7500,
+                                 startweight=42,
+                                 reserve=True)
+    psbt = bitcoind.rpc.joinpsbts([l2_funding['psbt'], output_pbst])
+    l2_signed_psbt = l2.rpc.signpsbt(psbt)['signed_psbt']
+    l1.rpc.sendpsbt(l2_signed_psbt)
+
+    # Re-try sending the same tx?
+    bitcoind.generate_block(1)
+    sync_blockheight(bitcoind, [l1])
+    # Expect an error here
+    with pytest.raises(JSONRPCError, match=r"Transaction already in block chain"):
+        bitcoind.rpc.sendrawtransaction(broadcast_tx['tx'])
+
+    # Try an empty PSBT
+    with pytest.raises(RpcError, match=r"should be a PSBT, not"):
+        l1.rpc.signpsbt('')
+    with pytest.raises(RpcError, match=r"should be a PSBT, not"):
+        l1.rpc.sendpsbt('')
+
+    # Try an invalid PSBT string
+    invalid_psbt = 'cHNidP8BAM0CAAAABJ9446mTRp/ml8OxSLC1hEvrcxG1L02AG7YZ4syHon2sAQAAAAD9////JFJH/NjKwjwrP9myuU68G7t8Q4VIChH0KUkZ5hSAyqcAAAAAAP3///8Uhrj0XDRhGRno8V7qEe4hHvZcmEjt3LQSIXWc+QU2tAEAAAAA/f///wstLikuBrgZJI83VPaY8aM7aPe5U6TMb06+jvGYzQLEAQAAAAD9////AcDGLQAAAAAAFgAUyQltQ/QI6lJgICYsza18hRa5KoEAAAAAAAEBH0BCDwAAAAAAFgAUqc1Qh7Q5kY1noDksmj7cJmHaIbQAAQEfQEIPAAAAAAAWABS3bdYeQbXvBSryHNoyYIiMBwu5rwABASBAQg8AAAAAABepFD1r0NuqAA+R7zDiXrlP7J+/PcNZhwEEFgAUKvGgVL/ThjWE/P1oORVXh/ObucYAAQEgQEIPAAAAAAAXqRRsrE5ugA1VJnAith5+msRMUTwl8ocBBBYAFMrfGCiLi0ZnOCY83ERKJ1sLYMY8A='
+    with pytest.raises(RpcError, match=r"should be a PSBT, not"):
+        l1.rpc.signpsbt(invalid_psbt)
+
+    wallet_coin_mvts = [
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 1000000000, 'debit': 0, 'tag': 'deposit'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 3000000000, 'tag': 'withdrawal'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 1000000000, 'tag': 'chain_fees'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 0, 'tag': 'spend_track'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 3000000000, 'tag': 'withdrawal'},
+        {'type': 'chain_mvt', 'credit': 0, 'debit': 1000000000, 'tag': 'chain_fees'},
+    ]
+
+    check_coin_moves(l1, 'wallet', wallet_coin_mvts, chainparams)
 
 
 def test_txsend(node_factory, bitcoind, chainparams):
@@ -485,9 +922,10 @@ def test_txprepare_restart(node_factory, bitcoind, chainparams):
     # It goes backwards in blockchain just in case there was a reorg.  Wait.
     wait_for(lambda: [o['status'] for o in l1.rpc.listfunds()['outputs']] == ['confirmed'] * 10)
 
-    # It should have logged this for each output.
-    for i in decode['vin']:
-        assert l1.daemon.is_in_log('wallet: reserved output {}/{} reset to available'.format(i['txid'], i['vout']))
+    # It should have logged this for each output (any order)
+    template = r'wallet: reserved output {}/{} reset to available'
+    lines = [template.format(i['txid'], i['vout']) for i in decode['vin']]
+    l1.daemon.wait_for_logs(lines)
 
     prep = l1.rpc.txprepare([{addr: 'all'}])
     decode = bitcoind.rpc.decoderawtransaction(prep['unsigned_tx'])
@@ -567,42 +1005,168 @@ def test_transaction_annotations(node_factory, bitcoind):
 
 
 @unittest.skipIf(VALGRIND, "It does not play well with prompt and key derivation.")
-def test_hsm_secret_encryption(node_factory, executor):
-    l1 = node_factory.get_node()
+def test_hsm_secret_encryption(node_factory):
+    l1 = node_factory.get_node(may_fail=True)  # May fail when started without key
     password = "reckful\n"
     # We need to simulate a terminal to use termios in `lightningd`.
     master_fd, slave_fd = os.openpty()
 
     # Test we can encrypt an already-existing and not encrypted hsm_secret
-    l1.rpc.stop()
+    l1.stop()
     l1.daemon.opts.update({"encrypted-hsm": None})
     l1.daemon.start(stdin=slave_fd, wait_for_initialized=False)
-    time.sleep(3 if SLOW_MACHINE else 1)
+    l1.daemon.wait_for_log(r'The hsm_secret is encrypted')
+
     os.write(master_fd, password.encode("utf-8"))
     l1.daemon.wait_for_log("Server started with public key")
     id = l1.rpc.getinfo()["id"]
+    l1.stop()
 
     # Test we cannot start the same wallet without specifying --encrypted-hsm
-    l1.stop()
     l1.daemon.opts.pop("encrypted-hsm")
-    l1.daemon.start(stdin=slave_fd, stderr=subprocess.STDOUT,
-                    wait_for_initialized=False)
-    time.sleep(3 if SLOW_MACHINE else 1)
-    os.write(master_fd, password[2:].encode("utf-8"))
-    err = "hsm_secret is encrypted, you need to pass the --encrypted-hsm startup option."
-    assert l1.daemon.is_in_log(err)
+    with pytest.raises(subprocess.CalledProcessError, match=r'returned non-zero exit status 1'):
+        subprocess.check_call(l1.daemon.cmd_line)
 
     # Test we cannot restore the same wallet with another password
     l1.daemon.opts.update({"encrypted-hsm": None})
     l1.daemon.start(stdin=slave_fd, stderr=subprocess.STDOUT,
                     wait_for_initialized=False)
-    time.sleep(3 if SLOW_MACHINE else 1)
+    l1.daemon.wait_for_log(r'The hsm_secret is encrypted')
     os.write(master_fd, password[2:].encode("utf-8"))
-    l1.daemon.wait_for_log("Wrong password for encrypted hsm_secret.")
+    assert(l1.daemon.proc.wait() == 1)
+    assert(l1.daemon.is_in_log("Wrong password for encrypted hsm_secret."))
 
     # Test we can restore the same wallet with the same password
     l1.daemon.start(stdin=slave_fd, wait_for_initialized=False)
-    time.sleep(3 if SLOW_MACHINE else 1)
+    l1.daemon.wait_for_log(r'The hsm_secret is encrypted')
     os.write(master_fd, password.encode("utf-8"))
     l1.daemon.wait_for_log("Server started with public key")
     assert id == l1.rpc.getinfo()["id"]
+
+
+@unittest.skipIf(VALGRIND, "It does not play well with prompt and key derivation.")
+def test_hsmtool_secret_decryption(node_factory):
+    l1 = node_factory.get_node()
+    password = "reckless\n"
+    hsm_path = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "hsm_secret")
+    # We need to simulate a terminal to use termios in `lightningd`.
+    master_fd, slave_fd = os.openpty()
+
+    # Encrypt the master seed
+    l1.stop()
+    l1.daemon.opts.update({"encrypted-hsm": None})
+    l1.daemon.start(stdin=slave_fd, wait_for_initialized=False)
+    l1.daemon.wait_for_log(r'The hsm_secret is encrypted')
+    os.write(master_fd, password.encode("utf-8"))
+    l1.daemon.wait_for_log("Server started with public key")
+    node_id = l1.rpc.getinfo()["id"]
+    l1.stop()
+
+    # We can't use a wrong password !
+    cmd_line = ["tools/hsmtool", "decrypt", hsm_path, "A wrong pass"]
+    with pytest.raises(subprocess.CalledProcessError):
+        subprocess.check_call(cmd_line)
+
+    # Decrypt it with hsmtool
+    cmd_line[3] = password[:-1]
+    subprocess.check_call(cmd_line)
+    # Then test we can now start it without password
+    l1.daemon.opts.pop("encrypted-hsm")
+    l1.daemon.start(stdin=slave_fd, wait_for_initialized=True)
+    assert node_id == l1.rpc.getinfo()["id"]
+    l1.stop()
+
+    # Test we can encrypt it offline
+    cmd_line[1] = "encrypt"
+    subprocess.check_call(cmd_line)
+    # Now we need to pass the encrypted-hsm startup option
+    l1.stop()
+
+    with pytest.raises(subprocess.CalledProcessError, match=r'returned non-zero exit status 1'):
+        subprocess.check_call(l1.daemon.cmd_line)
+
+    l1.daemon.opts.update({"encrypted-hsm": None})
+    master_fd, slave_fd = os.openpty()
+    l1.daemon.start(stdin=slave_fd, stderr=subprocess.STDOUT,
+                    wait_for_initialized=False)
+
+    l1.daemon.wait_for_log(r'The hsm_secret is encrypted')
+    os.write(master_fd, password.encode("utf-8"))
+    l1.daemon.wait_for_log("Server started with public key")
+    assert node_id == l1.rpc.getinfo()["id"]
+    l1.stop()
+
+    # And finally test that we can also decrypt if encrypted with hsmtool
+    cmd_line[1] = "decrypt"
+    subprocess.check_call(cmd_line)
+    l1.daemon.opts.pop("encrypted-hsm")
+    l1.daemon.start(stdin=slave_fd, wait_for_initialized=True)
+    assert node_id == l1.rpc.getinfo()["id"]
+
+
+# this test does a 'listtransactions' on a yet unconfirmed channel
+def test_fundchannel_listtransaction(node_factory, bitcoind):
+    l1, l2 = node_factory.get_nodes(2)
+    l1.fundwallet(10**6)
+
+    l1.connect(l2)
+    txid = l1.rpc.fundchannel(l2.info['id'], 10**5)['txid']
+
+    # next call warned about SQL Accessing a null column
+    # and crashed the daemon for accessing random memory or null
+    txs = l1.rpc.listtransactions()['transactions']
+
+    tx = [t for t in txs if t['hash'] == txid][0]
+    assert tx['blockheight'] == 0
+
+
+def test_withdraw_nlocktime(node_factory):
+    """
+    Test that we don't set the nLockTime to 0 for withdrawal and
+    txprepare transactions.
+    """
+    l1 = node_factory.get_node(1)
+    l1.fundwallet(10**4)
+    l1.fundwallet(10**4)
+
+    # withdraw
+    addr = l1.rpc.newaddr()["bech32"]
+    tx = l1.rpc.withdraw(addr, 10**3)["tx"]
+    nlocktime = node_factory.bitcoind.rpc.decoderawtransaction(tx)["locktime"]
+    tip = node_factory.bitcoind.rpc.getblockcount()
+
+    assert nlocktime > 0 and nlocktime <= tip
+
+    # txprepare
+    txid = l1.rpc.txprepare([{addr: 10**3}])["txid"]
+    tx = l1.rpc.txsend(txid)["tx"]
+    nlocktime = node_factory.bitcoind.rpc.decoderawtransaction(tx)["locktime"]
+    tip = node_factory.bitcoind.rpc.getblockcount()
+
+    assert nlocktime > 0 and nlocktime <= tip
+
+
+@flaky
+@unittest.skipIf(VALGRIND, "A big loop is used to check fuzz.")
+def test_withdraw_nlocktime_fuzz(node_factory, bitcoind):
+    """
+    Test that we eventually fuzz nLockTime for withdrawal transactions.
+    Marked flaky "just in case" as we fuzz from 0 to 100 with a 10%
+    probability.
+    """
+    l1 = node_factory.get_node(1)
+    l1.fundwallet(10**8)
+
+    for i in range(100):
+        addr = l1.rpc.newaddr()["bech32"]
+        withdraw = l1.rpc.withdraw(addr, 10**3)
+        bitcoind.generate_block(1)
+        l1.daemon.wait_for_log('Owning output .* txid {} CONFIRMED'.
+                               format(withdraw["txid"]))
+        decoded = bitcoind.rpc.decoderawtransaction(withdraw["tx"])
+        tip = node_factory.bitcoind.rpc.getblockcount()
+        assert decoded["locktime"] > 0
+        if decoded["locktime"] < tip:
+            return
+    else:
+        raise Exception("No transaction with fuzzed nLockTime !")

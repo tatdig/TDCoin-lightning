@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <ccan/fdpass/fdpass.h>
 #include <common/crypto_sync.h>
 #include <common/gossip_rcvd_filter.h>
@@ -115,7 +116,7 @@ void handle_gossip_msg(struct per_peer_state *pps, const u8 *msg TAKES)
 		goto out;
 	} else
 		/* It's a raw gossip msg: this copies or takes() */
-		gossip = tal_dup_arr(tmpctx, u8, msg, tal_bytelen(msg), 0);
+		gossip = tal_dup_talarr(tmpctx, u8, msg);
 
 	/* Gossipd can send us gossip messages, OR errors */
 	if (fromwire_peektype(gossip) == WIRE_ERROR) {
@@ -148,12 +149,18 @@ bool handle_timestamp_filter(struct per_peer_state *pps, const u8 *msg TAKES)
 
 bool handle_peer_gossip_or_error(struct per_peer_state *pps,
 				 const struct channel_id *channel_id,
+				 bool soft_error,
 				 const u8 *msg TAKES)
 {
 	char *err;
 	bool all_channels;
 	struct channel_id actual;
 
+#if DEVELOPER
+	/* Any odd-typed unknown message is handled by the caller, so if we
+	 * find one here it's an error. */
+	assert(!is_unknown_msg_discardable(msg));
+#else
 	/* BOLT #1:
 	 *
 	 * A receiving node:
@@ -162,6 +169,7 @@ bool handle_peer_gossip_or_error(struct per_peer_state *pps,
 	 */
 	if (is_unknown_msg_discardable(msg))
 		goto handled;
+#endif
 
 	if (handle_timestamp_filter(pps, msg))
 		return true;
@@ -176,7 +184,8 @@ bool handle_peer_gossip_or_error(struct per_peer_state *pps,
 		if (err)
 			peer_failed_received_errmsg(pps, err,
 						    all_channels
-						    ? NULL : channel_id);
+						    ? NULL : channel_id,
+						    soft_error);
 
 		/* Ignore unknown channel errors. */
 		goto handled;

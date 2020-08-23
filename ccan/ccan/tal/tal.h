@@ -131,10 +131,11 @@ void *tal_free(const tal_t *p);
 /**
  * tal_steal - change the parent of a tal-allocated pointer.
  * @ctx: The new parent.
- * @ptr: The tal allocated object to move.
+ * @ptr: The tal allocated object to move, or NULL.
  *
  * This may need to perform an allocation, in which case it may fail; thus
- * it can return NULL, otherwise returns @ptr.
+ * it can return NULL, otherwise returns @ptr.  If @ptr is NULL, this function does
+ * nothing.
  */
 #if HAVE_STATEMENT_EXPR
 /* Weird macro avoids gcc's 'warning: value computed is not used'. */
@@ -164,7 +165,8 @@ void *tal_free(const tal_t *p);
  * @function: the function to call before it's freed.
  *
  * If @function has not been successfully added as a destructor, this returns
- * false.
+ * false.  Note that if we're inside the destructor call itself, this will
+ * return false.
  */
 #define tal_del_destructor(ptr, function)				      \
 	tal_del_destructor_((ptr), typesafe_cb(void, void *, (function), (ptr)))
@@ -195,7 +197,8 @@ void *tal_free(const tal_t *p);
  * @function: the function to call before it's freed.
  *
  * If @function has not been successfully added as a destructor, this returns
- * false.
+ * false.  Note that if we're inside the destructor call itself, this will
+ * return false.
  */
 #define tal_del_destructor(ptr, function)				      \
 	tal_del_destructor_((ptr), typesafe_cb(void, void *, (function), (ptr)))

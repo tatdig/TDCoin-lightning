@@ -5,10 +5,13 @@
 #include <ccan/short_types/short_types.h>
 #include <common/json.h>
 #include <common/node_id.h>
+#include <common/sphinx.h>
 #include <wire/wire.h>
 
 struct amount_msat;
 struct amount_sat;
+struct bitcoin_txid;
+struct channel_id;
 struct command;
 struct command_result;
 struct json_escape;
@@ -24,10 +27,14 @@ struct command_result *param_bool(struct command *cmd, const char *name,
 				  const char *buffer, const jsmntok_t *tok,
 				  bool **b);
 
-/* Extract double from this (must be a number literal) */
-struct command_result *param_double(struct command *cmd, const char *name,
-				    const char *buffer, const jsmntok_t *tok,
-				    double **num);
+/*
+ * Extract a non-negative (either 0 or positive) floating-point number from this
+ * (must be a number literal), multiply it by 1 million and return it as an
+ * integer.
+ */
+struct command_result *param_millionths(struct command *cmd, const char *name,
+					const char *buffer,
+					const jsmntok_t *tok, uint64_t **num);
 
 /* Extract an escaped string (and unescape it) */
 struct command_result *param_escaped_string(struct command *cmd,
@@ -55,11 +62,6 @@ struct command_result *param_number(struct command *cmd, const char *name,
 struct command_result *param_sha256(struct command *cmd, const char *name,
 				    const char *buffer, const jsmntok_t *tok,
 				    struct sha256 **hash);
-
-/* Extract double in range [0.0, 100.0] */
-struct command_result *param_percent(struct command *cmd, const char *name,
-				     const char *buffer, const jsmntok_t *tok,
-				     double **num);
 
 /* Extract number from this (may be a string, or a number literal) */
 struct command_result *param_u64(struct command *cmd, const char *name,
@@ -111,4 +113,56 @@ struct command_result *param_ignore(struct command *cmd, const char *name,
 				    const char *buffer, const jsmntok_t *tok,
 				    const void *unused);
 
+/* Extract a secret from this string */
+struct command_result *param_secret(struct command *cmd, const char *name,
+				    const char *buffer, const jsmntok_t *tok,
+				    struct secret **secret);
+
+/* Extract a binary value from the param and unhexlify it. */
+struct command_result *param_bin_from_hex(struct command *cmd, const char *name,
+					  const char *buffer, const jsmntok_t *tok,
+					  u8 **bin);
+
+struct command_result *param_hops_array(struct command *cmd, const char *name,
+					const char *buffer, const jsmntok_t *tok,
+					struct sphinx_hop **hops);
+
+struct command_result *param_secrets_array(struct command *cmd,
+					   const char *name, const char *buffer,
+					   const jsmntok_t *tok,
+					   struct secret **secrets);
+
+struct command_result *param_feerate_val(struct command *cmd,
+					 const char *name, const char *buffer,
+					 const jsmntok_t *tok,
+					 u32 **feerate_per_kw);
+
+struct command_result *param_txid(struct command *cmd,
+				  const char *name,
+				  const char *buffer,
+				  const jsmntok_t *tok,
+				  struct bitcoin_txid **txid);
+
+enum address_parse_result {
+	/* Not recognized as an onchain address */
+	ADDRESS_PARSE_UNRECOGNIZED,
+	/* Recognized as an onchain address, but targets wrong network */
+	ADDRESS_PARSE_WRONG_NETWORK,
+	/* Recognized and succeeds */
+	ADDRESS_PARSE_SUCCESS,
+};
+/* Return result of address parsing and fills in *scriptpubkey
+ * allocated off ctx if ADDRESS_PARSE_SUCCESS
+ */
+enum address_parse_result json_to_address_scriptpubkey(const tal_t *ctx,
+			     const struct chainparams *chainparams,
+			     const char *buffer,
+			     const jsmntok_t *tok, const u8 **scriptpubkey);
+
+
+struct command_result *param_bitcoin_address(struct command *cmd,
+					     const char *name,
+					     const char *buffer,
+					     const jsmntok_t *tok,
+					     const u8 **scriptpubkey);
 #endif /* LIGHTNING_COMMON_JSON_TOK_H */

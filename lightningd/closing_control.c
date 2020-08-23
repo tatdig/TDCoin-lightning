@@ -2,6 +2,7 @@
 #include <bitcoin/script.h>
 #include <closingd/gen_closing_wire.h>
 #include <common/close_tx.h>
+#include <common/fee_states.h>
 #include <common/initial_commit_tx.h>
 #include <common/per_peer_state.h>
 #include <common/utils.h>
@@ -48,12 +49,10 @@ static struct amount_sat calc_tx_fee(struct amount_sat sat_in,
 	return fee;
 }
 
-/* Is this better than the last tx we were holding?  This can happen
- * even without closingd misbehaving, if we have multiple,
- * interrupted, rounds of negotiation. */
-static bool better_closing_fee(struct lightningd *ld,
-			       struct channel *channel,
-			       const struct bitcoin_tx *tx)
+/* Assess whether a proposed closing fee is acceptable. */
+static bool closing_fee_is_acceptable(struct lightningd *ld,
+				      struct channel *channel,
+				      const struct bitcoin_tx *tx)
 {
 	struct amount_sat fee, last_fee, min_fee;
 	u64 weight;
@@ -70,7 +69,7 @@ static bool better_closing_fee(struct lightningd *ld,
 		  type_to_string(tmpctx, struct amount_sat, &last_fee));
 
 	/* Weight once we add in sigs. */
-	weight = bitcoin_tx_weight(tx) + 74 * 2;
+	weight = bitcoin_tx_weight(tx) + bitcoin_tx_input_sig_weight() * 2;
 
 	/* If we don't have a feerate estimate, this gives feerate_floor */
 	min_feerate = feerate_min(ld, &feerate_unknown);
@@ -84,15 +83,10 @@ static bool better_closing_fee(struct lightningd *ld,
 		return false;
 	}
 
-	/* In case of a tie, prefer new over old: this covers the preference
+	/* Prefer new over old: this covers the preference
 	 * for a mutual close over a unilateral one. */
 
-	/* If we don't know the feerate, prefer higher fee. */
-	if (feerate_unknown)
-		return amount_sat_greater_eq(fee, last_fee);
-
-	/* Otherwise prefer lower fee. */
-	return amount_sat_less_eq(fee, last_fee);
+	return true;
 }
 
 static void peer_received_closing_signature(struct channel *channel,
@@ -108,10 +102,10 @@ static void peer_received_closing_signature(struct channel *channel,
 				       tal_hex(msg, msg));
 		return;
 	}
-	tx->chainparams = get_chainparams(channel->peer->ld);
+	tx->chainparams = chainparams;
 
 	/* FIXME: Make sure signature is correct! */
-	if (better_closing_fee(ld, channel, tx)) {
+	if (closing_fee_is_acceptable(ld, channel, tx)) {
 		channel_set_last_tx(channel, tx, &sig, TX_CHANNEL_CLOSE);
 		wallet_channel_save(ld->wallet, channel);
 	}
@@ -181,6 +175,7 @@ void peer_start_closingd(struct channel *channel,
 	int hsmfd;
 	struct secret last_remote_per_commit_secret;
 	struct lightningd *ld = channel->peer->ld;
+	u32 final_commit_feerate;
 
 	if (!channel->shutdown_scriptpubkey[REMOTE]) {
 		channel_internal_error(channel,
@@ -195,7 +190,8 @@ void peer_start_closingd(struct channel *channel,
 	channel_set_owner(channel,
 			  new_channel_subd(ld,
 					   "lightning_closingd",
-					   channel, channel->log, true,
+					   channel, &channel->peer->id,
+					   channel->log, true,
 					   closing_wire_type_name, closing_msg,
 					   channel_errmsg,
 					   channel_set_billboard,
@@ -206,7 +202,7 @@ void peer_start_closingd(struct channel *channel,
 					   NULL));
 
 	if (!channel->owner) {
-		log_unusual(channel->log, "Could not subdaemon closing: %s",
+		log_broken(channel->log, "Could not subdaemon closing: %s",
 			    strerror(errno));
 		channel_fail_reconnect_later(channel,
 					     "Failed to subdaemon closing");
@@ -220,20 +216,24 @@ void peer_start_closingd(struct channel *channel,
 	 *    fee of the final commitment transaction, as calculated in
 	 *    [BOLT #3](03-transactions.md#fee-calculation).
 	 */
-	feelimit = commit_tx_base_fee(channel->channel_info.feerate_per_kw[LOCAL],
-				      0);
+	final_commit_feerate = get_feerate(channel->channel_info.fee_states,
+					   channel->opener, LOCAL);
+	feelimit = commit_tx_base_fee(final_commit_feerate, 0,
+				      channel->option_anchor_outputs);
 
 	/* Pick some value above slow feerate (or min possible if unknown) */
-	minfee = commit_tx_base_fee(feerate_min(ld, NULL), 0);
+	minfee = commit_tx_base_fee(feerate_min(ld, NULL), 0,
+				    channel->option_anchor_outputs);
 
 	/* If we can't determine feerate, start at half unilateral feerate. */
 	feerate = mutual_close_feerate(ld->topology);
 	if (!feerate) {
-		feerate = channel->channel_info.feerate_per_kw[LOCAL] / 2;
+		feerate = final_commit_feerate / 2;
 		if (feerate < feerate_floor())
 			feerate = feerate_floor();
 	}
-	startfee = commit_tx_base_fee(feerate, 0);
+	startfee = commit_tx_base_fee(feerate, 0,
+				      channel->option_anchor_outputs);
 
 	if (amount_sat_greater(startfee, feelimit))
 		startfee = feelimit;
@@ -286,13 +286,15 @@ void peer_start_closingd(struct channel *channel,
 				      channel->funding,
 				      &channel->local_funding_pubkey,
 				      &channel->channel_info.remote_fundingkey,
-				      channel->funder,
+				      channel->opener,
 				      amount_msat_to_sat_round_down(channel->our_msat),
 				      amount_msat_to_sat_round_down(their_msat),
 				      channel->our_config.dust_limit,
 				      minfee, feelimit, startfee,
 				      channel->shutdown_scriptpubkey[LOCAL],
 				      channel->shutdown_scriptpubkey[REMOTE],
+				      channel->closing_fee_negotiation_step,
+				      channel->closing_fee_negotiation_step_unit,
 				      reconnected,
 				      channel->next_index[LOCAL],
 				      channel->next_index[REMOTE],

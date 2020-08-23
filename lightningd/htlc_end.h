@@ -36,14 +36,11 @@ struct htlc_in {
 	/* Shared secret for us to send any failure message (NULL if malformed) */
 	struct secret *shared_secret;
 
-	/* If a local error, this is non-zero. */
-	enum onion_type failcode;
+	/* If we couldn't decode the onion, this contains the error code.. */
+	enum onion_type badonion;
 
-	/* For a remote error. */
-	const u8 *failuremsg;
-
-	/* If failcode & UPDATE, this is the channel which failed. */
-	struct short_channel_id failoutchannel;
+	/* Otherwise, this contains the failure message to send. */
+	const struct onionreply *failonion;
 
 	/* If they fulfilled, here's the preimage. */
 	struct preimage *preimage;
@@ -51,6 +48,13 @@ struct htlc_in {
 	/* Remember the timestamp we received this HTLC so we can later record
 	 * it, and the resolution time, in the forwards table. */
         struct timeabs received_time;
+
+	/* If it was blinded. */
+	struct pubkey *blinding;
+	/* Only set if blinding != NULL */
+	struct secret blinding_ss;
+	/* true if we supplied the preimage */
+	bool *we_filled;
 };
 
 struct htlc_out {
@@ -58,7 +62,6 @@ struct htlc_out {
 	 * is saved to the database, must be >0 after saving to the
 	 * database. */
 	u64 dbid;
-	u64 origin_htlc_id;
 	struct htlc_key key;
 	struct amount_msat msat;
 	u32 cltv_expiry;
@@ -69,11 +72,11 @@ struct htlc_out {
 	/* Onion information */
 	u8 onion_routing_packet[TOTAL_PACKET_SIZE];
 
-	/* If a local error, this is non-zero. */
-	enum onion_type failcode;
+	/* If a local error, this is non-NULL. */
+	const u8 *failmsg;
 
 	/* For a remote error. */
-	const u8 *failuremsg;
+	const struct onionreply *failonion;
 
 	/* If we fulfilled, here's the preimage. */
 	/* FIXME: This is basically unused, except as a bool! */
@@ -82,8 +85,14 @@ struct htlc_out {
 	/* Is this a locally-generated payment?  Implies ->in is NULL. */
 	bool am_origin;
 
+	/* If am_origin, this is the partid of the payment. */
+	u64 partid;
+
 	/* Where it's from, if not going to us. */
 	struct htlc_in *in;
+
+	/* Blinding to send alongside, if any. */
+	struct pubkey *blinding;
 };
 
 static inline const struct htlc_key *keyof_htlc_in(const struct htlc_in *in)
@@ -120,6 +129,10 @@ struct htlc_in *find_htlc_in(const struct htlc_in_map *map,
 			     const struct channel *channel,
 			     u64 htlc_id);
 
+/* FIXME: Slow function only used at startup. */
+struct htlc_in *remove_htlc_in_by_dbid(struct htlc_in_map *remaining_htlcs_in,
+				       u64 dbid);
+
 struct htlc_out *find_htlc_out(const struct htlc_out_map *map,
 			       const struct channel *channel,
 			       u64 htlc_id);
@@ -130,6 +143,8 @@ struct htlc_in *new_htlc_in(const tal_t *ctx,
 			    struct amount_msat msat, u32 cltv_expiry,
 			    const struct sha256 *payment_hash,
 			    const struct secret *shared_secret TAKES,
+			    const struct pubkey *blinding TAKES,
+			    const struct secret *blinding_ss,
 			    const u8 *onion_routing_packet);
 
 /* You need to set the ID, then connect_htlc_out this! */
@@ -139,7 +154,9 @@ struct htlc_out *new_htlc_out(const tal_t *ctx,
 			      u32 cltv_expiry,
 			      const struct sha256 *payment_hash,
 			      const u8 *onion_routing_packet,
+			      const struct pubkey *blinding,
 			      bool am_origin,
+			      u64 partid,
 			      struct htlc_in *in);
 
 void connect_htlc_in(struct htlc_in_map *map, struct htlc_in *hin);

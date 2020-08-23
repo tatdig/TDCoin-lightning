@@ -26,13 +26,14 @@ struct bitcoin_tx *funding_tx(const tal_t *ctx,
 	struct bitcoin_tx *tx;
 	bool has_change = !amount_sat_eq(change, AMOUNT_SAT(0));
 
-	tx = tx_spending_utxos(ctx, chainparams, utxomap, bip32_base, has_change, 1);
+	tx = tx_spending_utxos(ctx, chainparams, utxomap, bip32_base,
+			       has_change, 1, 0, BITCOIN_TX_DEFAULT_SEQUENCE);
 
 
 	wscript = bitcoin_redeem_2of2(tx, local_fundingkey, remote_fundingkey);
 	SUPERVERBOSE("# funding witness script = %s\n",
 		     tal_hex(wscript, wscript));
-	bitcoin_tx_add_output(tx, scriptpubkey_p2wsh(tx, wscript), funding);
+	bitcoin_tx_add_output(tx, scriptpubkey_p2wsh(tx, wscript), wscript, funding);
 	tal_free(wscript);
 
 	if (has_change) {
@@ -40,7 +41,7 @@ struct bitcoin_tx *funding_tx(const tal_t *ctx,
 		map[0] = int2ptr(0);
 		map[1] = int2ptr(1);
 		bitcoin_tx_add_output(tx, scriptpubkey_p2wpkh(tx, changekey),
-				      change);
+				      NULL, change);
 		permute_outputs(tx, NULL, map);
 		*outnum = (map[0] == int2ptr(0) ? 0 : 1);
 	} else {
@@ -49,7 +50,7 @@ struct bitcoin_tx *funding_tx(const tal_t *ctx,
 
 	permute_inputs(tx, (const void **)utxomap);
 
-	elements_tx_add_fee_output(tx);
+	bitcoin_tx_finalize(tx);
 	assert(bitcoin_tx_check(tx));
 	return tx;
 }

@@ -5,6 +5,8 @@
 #include <ccan/tal/str/str.h>
 #include <common/addr.h>
 #include <common/amount.h>
+#include <common/features.h>
+#include <common/json_stream.h>
 #include <common/json_tok.h>
 #include <common/type_to_string.h>
 #include <common/utils.h>
@@ -22,12 +24,17 @@ struct funding_req {
 	const char *funding_str;
 	const char *utxo_str;
 	bool funding_all;
+	struct amount_msat *push_msat;
+
+	/* Features offered by this peer. */
+	const u8 *their_features;
 
 	bool *announce_channel;
 	u32 *minconf;
 
 	/* The prepared tx id */
 	struct bitcoin_txid tx_id;
+	u32 outnum;
 
 	const char *chanstr;
 	const u8 *out_script;
@@ -37,43 +44,6 @@ struct funding_req {
 	/* Raw JSON from RPC output */
 	const char *error;
 };
-
-/* Helper to copy JSON object directly into a json_out */
-static void json_out_add_raw_len(struct json_out *jout,
-				 const char *fieldname,
-				 const char *jsonstr, size_t len)
-{
-	char *p;
-
-	p = json_out_member_direct(jout, fieldname, len);
-	memcpy(p, jsonstr, len);
-}
-
-/* Helper to add a boolean to a json_out */
-static void json_out_addbool(struct json_out *jout,
-		             const char *fieldname,
-			     const bool val)
-{
-	if (val)
-		json_out_add(jout, fieldname, false, "true");
-	else
-		json_out_add(jout, fieldname, false, "false");
-}
-
-/* Copy field and member to output, if it exists: return member */
-static const jsmntok_t *copy_member(struct json_out *ret,
-				    const char *buf, const jsmntok_t *obj,
-				    const char *membername)
-{
-	const jsmntok_t *m = json_get_member(buf, obj, membername);
-	if (!m)
-		return NULL;
-
-	/* Literal copy: it's already JSON escaped, and may be a string. */
-	json_out_add_raw_len(ret, membername,
-			     json_tok_full(buf, m), json_tok_full_len(m));
-	return m;
-}
 
 static struct command_result *send_prior(struct command *cmd,
 					 const char *buf,
@@ -88,23 +58,20 @@ static struct command_result *tx_abort(struct command *cmd,
 				       const jsmntok_t *error,
 				       struct funding_req *fr)
 {
-	struct json_out *ret;
+	struct out_req *req;
 
 	/* We stash the error so we can return it after we've cleaned up */
 	fr->error = json_strdup(fr, buf, error);
 
-	ret = json_out_new(NULL);
-	json_out_start(ret, NULL,  '{');
-	json_out_addstr(ret, "txid",
+	req = jsonrpc_request_start(cmd->plugin, cmd, "txdiscard",
+				    send_prior, send_prior, fr);
+	json_add_string(req->js, "txid",
 			type_to_string(tmpctx, struct bitcoin_txid, &fr->tx_id));
-	json_out_end(ret, '}');
 
 	/* We need to call txdiscard, and forward the actual cause for the
 	 * error after we've cleaned up. We swallow any errors returned by
 	 * this call, as we don't really care if it succeeds or not */
-	return send_outreq(cmd, "txdiscard",
-			   send_prior, send_prior,
-			   fr, take(ret));
+	return send_outreq(cmd->plugin, req);
 }
 
 /* We're basically done, we just need to format the output to match
@@ -114,17 +81,16 @@ static struct command_result *finish(struct command *cmd,
 				     const jsmntok_t *result,
 				     struct funding_req *fr)
 {
-	struct json_out *out;
+	struct json_stream *out;
 
-	out = json_out_new(NULL);
-	json_out_start(out, NULL, '{');
-	copy_member(out, buf, result, "tx");
-	json_out_addstr(out, "txid",
+	out = jsonrpc_stream_success(cmd);
+	json_add_tok(out, "tx", json_get_member(buf, result, "tx"), buf);
+	json_add_string(out, "txid",
 			type_to_string(tmpctx, struct bitcoin_txid, &fr->tx_id));
-	json_out_addstr(out, "channel_id", fr->chanstr);
-	json_out_end(out, '}');
+	json_add_u32(out, "outnum", fr->outnum);
+	json_add_string(out, "channel_id", fr->chanstr);
 
-	return command_success(cmd, out);
+	return command_finished(cmd, out);
 }
 
 /* We're ready to broadcast the transaction */
@@ -134,7 +100,7 @@ static struct command_result *send_tx(struct command *cmd,
 				      struct funding_req *fr)
 {
 
-	struct json_out *ret;
+	struct out_req *req;
 	const jsmntok_t *tok;
 	bool commitments_secured;
 
@@ -142,21 +108,18 @@ static struct command_result *send_tx(struct command *cmd,
 	tok = json_get_member(buf, result, "commitments_secured");
 	if (!json_to_bool(buf, tok, &commitments_secured) || !commitments_secured)
 		/* TODO: better failure path? this should never fail though. */
-		plugin_err("Commitment not secured.");
+		plugin_err(cmd->plugin, "Commitment not secured.");
 
 	/* Stash the channel_id so we can return it when finalized */
 	tok = json_get_member(buf, result, "channel_id");
 	fr->chanstr = json_strdup(fr, buf, tok);
 
-	ret = json_out_new(NULL);
-	json_out_start(ret, NULL, '{');
-	json_out_addstr(ret, "txid",
+	req = jsonrpc_request_start(cmd->plugin, cmd, "txsend",
+				    finish, tx_abort, fr);
+	json_add_string(req->js, "txid",
 			type_to_string(tmpctx, struct bitcoin_txid, &fr->tx_id));
-	json_out_end(ret, '}');
 
-	return send_outreq(cmd, "txsend",
-			   finish, tx_abort,
-			   fr, take(ret));
+	return send_outreq(cmd->plugin, req);
 }
 
 static struct command_result *tx_prepare_done(struct command *cmd,
@@ -166,56 +129,52 @@ static struct command_result *tx_prepare_done(struct command *cmd,
 {
 	const jsmntok_t *txid_tok;
 	const jsmntok_t *tx_tok;
-	struct json_out *ret;
+	struct out_req *req;
 	const struct bitcoin_tx *tx;
 	const char *hex;
-	u32 outnum;
 	bool outnum_found;
 
 	txid_tok = json_get_member(buf, result, "txid");
 	if (!txid_tok)
-		plugin_err("txprepare missing 'txid' field");
+		plugin_err(cmd->plugin, "txprepare missing 'txid' field");
 
 	tx_tok = json_get_member(buf, result, "unsigned_tx");
 	if (!tx_tok)
-		plugin_err("txprepare missing 'unsigned_tx' field");
+		plugin_err(cmd->plugin, "txprepare missing 'unsigned_tx' field");
 
 	hex = json_strdup(tmpctx, buf, tx_tok);
 	tx = bitcoin_tx_from_hex(fr, hex, strlen(hex));
 	if (!tx)
-		plugin_err("Unable to parse tx %s", hex);
+		plugin_err(cmd->plugin, "Unable to parse tx %s", hex);
 
 	/* Find the txout */
 	outnum_found = false;
 	for (size_t i = 0; i < tx->wtx->num_outputs; i++) {
 		const u8 *output_script = bitcoin_tx_output_get_script(fr, tx, i);
 		if (scripteq(output_script, fr->out_script)) {
-			outnum = i;
+			fr->outnum = i;
 			outnum_found = true;
 			break;
 		}
 	}
 	if (!outnum_found)
-		plugin_err("txprepare doesn't include our funding output. "
+		plugin_err(cmd->plugin, "txprepare doesn't include our funding output. "
 			   "tx: %s, output: %s",
 			   type_to_string(tmpctx, struct bitcoin_tx, tx),
 			   tal_hex(tmpctx, fr->out_script));
 
 	hex = json_strdup(tmpctx, buf, txid_tok);
 	if (!bitcoin_txid_from_hex(hex, strlen(hex), &fr->tx_id))
-		plugin_err("Unable to parse txid %s", hex);
+		plugin_err(cmd->plugin, "Unable to parse txid %s", hex);
 
-	ret = json_out_new(NULL);
-	json_out_start(ret, NULL, '{');
-	json_out_addstr(ret, "id", node_id_to_hexstr(tmpctx, fr->id));
+	req = jsonrpc_request_start(cmd->plugin, cmd, "fundchannel_complete",
+				    send_tx, tx_abort, fr);
+	json_add_string(req->js, "id", node_id_to_hexstr(tmpctx, fr->id));
 	/* Note that hex is reused from above */
-	json_out_addstr(ret, "txid", hex);
-	json_out_add(ret, "txout", false, "%u", outnum);
-	json_out_end(ret, '}');
+	json_add_string(req->js, "txid", hex);
+	json_add_u32(req->js, "txout", fr->outnum);
 
-	return send_outreq(cmd, "fundchannel_complete",
-			   send_tx, tx_abort,
-			   fr, take(ret));
+	return send_outreq(cmd->plugin, req);
 }
 
 static struct command_result *cancel_start(struct command *cmd,
@@ -223,59 +182,50 @@ static struct command_result *cancel_start(struct command *cmd,
 					   const jsmntok_t *error,
 					   struct funding_req *fr)
 {
-	struct json_out *ret;
+	struct out_req *req;
 
 	/* We stash the error so we can return it after we've cleaned up */
 	fr->error = json_strdup(fr, buf, error);
 
-	ret = json_out_new(NULL);
-	json_out_start(ret, NULL, '{');
-	json_out_addstr(ret, "id", node_id_to_hexstr(tmpctx, fr->id));
-	json_out_end(ret, '}');
+	req = jsonrpc_request_start(cmd->plugin, cmd, "fundchannel_cancel",
+				    send_prior, send_prior, fr);
+	json_add_string(req->js, "id", node_id_to_hexstr(tmpctx, fr->id));
 
-	return send_outreq(cmd, "fundchannel_cancel",
-			   send_prior, send_prior,
-			   fr, take(ret));
+	return send_outreq(cmd->plugin, req);
 }
 
-static struct json_out *txprepare(struct command *cmd,
-				  struct funding_req *fr,
-				  const char *destination)
+static void txprepare(struct json_stream *js,
+		      struct funding_req *fr,
+		      const char *destination)
 {
-	struct json_out *ret;
-	ret = json_out_new(NULL);
-	json_out_start(ret, NULL, '{');
-
 	/* Add the 'outputs' */
-	json_out_start(ret, "outputs", '[');
-	json_out_start(ret, NULL, '{');
-	json_out_addstr(ret, destination, fr->funding_str);
-	json_out_end(ret, '}');
-	json_out_end(ret, ']');
+	json_array_start(js, "outputs");
+	json_object_start(js, NULL);
+	json_add_string(js, destination, fr->funding_str);
+	json_object_end(js);
+	json_array_end(js);
 
 	if (fr->feerate_str)
-		json_out_addstr(ret, "feerate", fr->feerate_str);
+		json_add_string(js, "feerate", fr->feerate_str);
 	if (fr->minconf)
-		json_out_add(ret, "minconf", false, "%u", *fr->minconf);
+		json_add_u32(js, "minconf", *fr->minconf);
 	if (fr->utxo_str)
-		json_out_add_raw_len(ret, "utxos", fr->utxo_str, strlen(fr->utxo_str));
-	json_out_end(ret, '}');
-
-	return ret;
+		json_add_jsonstr(js, "utxos", fr->utxo_str);
 }
 
 static struct command_result *prepare_actual(struct command *cmd,
-						     const char *buf,
-						     const jsmntok_t *result,
-						     struct funding_req *fr)
+					     const char *buf,
+					     const jsmntok_t *result,
+					     struct funding_req *fr)
 {
-	struct json_out *ret;
+	struct out_req *req;
 
-	ret = txprepare(cmd, fr, fr->funding_addr);
+	req = jsonrpc_request_start(cmd->plugin, cmd, "txprepare",
+				    tx_prepare_done, cancel_start,
+				    fr);
+	txprepare(req->js, fr, fr->funding_addr);
 
-	return send_outreq(cmd, "txprepare",
-			   tx_prepare_done, cancel_start,
-			   fr, take(ret));
+	return send_outreq(cmd->plugin, req);
 }
 
 static struct command_result *fundchannel_start_done(struct command *cmd,
@@ -283,7 +233,7 @@ static struct command_result *fundchannel_start_done(struct command *cmd,
 						     const jsmntok_t *result,
 						     struct funding_req *fr)
 {
-	struct json_out *ret;
+	struct out_req *req;
 
 	/* Save the outscript so we can fund the outnum later */
 	fr->out_script = json_tok_bin_from_hex(fr, buf,
@@ -294,50 +244,42 @@ static struct command_result *fundchannel_start_done(struct command *cmd,
 				       json_get_member(buf, result, "funding_address"));
 
 	/* Now that we're ready to go, cancel the reserved tx */
-	ret = json_out_new(NULL);
-	json_out_start(ret, NULL,  '{');
-	json_out_addstr(ret, "txid",
+	req = jsonrpc_request_start(cmd->plugin, cmd, "txdiscard",
+				    prepare_actual, cancel_start,
+				    fr);
+	json_add_string(req->js, "txid",
 			type_to_string(tmpctx, struct bitcoin_txid, &fr->tx_id));
-	json_out_end(ret, '}');
 
-	return send_outreq(cmd, "txdiscard",
-			   prepare_actual, cancel_start,
-			   fr, take(ret));
+	return send_outreq(cmd->plugin, req);
 }
 
 static struct command_result *fundchannel_start(struct command *cmd,
-						struct funding_req *fr)
+                                                struct funding_req *fr)
 {
-	struct json_out *ret = json_out_new(NULL);
+	struct out_req *req = jsonrpc_request_start(cmd->plugin, cmd,
+						    "fundchannel_start",
+						    fundchannel_start_done,
+						    tx_abort, fr);
 
-	json_out_start(ret, NULL, '{');
-	json_out_addstr(ret, "id", node_id_to_hexstr(tmpctx, fr->id));
+	json_add_string(req->js, "id", node_id_to_hexstr(tmpctx, fr->id));
 
-	if (deprecated_apis)
-		json_out_addstr(ret, "satoshi", fr->funding_str);
-	else
-		json_out_addstr(ret, "amount", fr->funding_str);
+	json_add_string(req->js, "amount", fr->funding_str);
 
 	if (fr->feerate_str)
-		json_out_addstr(ret, "feerate", fr->feerate_str);
+		json_add_string(req->js, "feerate", fr->feerate_str);
 	if (fr->announce_channel)
-		json_out_addbool(ret, "announce", *fr->announce_channel);
+		json_add_bool(req->js, "announce", *fr->announce_channel);
+	if (fr->push_msat)
+		json_add_string(req->js, "push_msat",
+				type_to_string(tmpctx, struct amount_msat, fr->push_msat));
 
-	json_out_end(ret, '}');
-	json_out_finished(ret);
-
-	/* FIXME: as a nice feature, we should check that the peer
-	 * you want to connect to is connected first. if not, we should
-	 * connect and then call fundchannel start!  */
-	return send_outreq(cmd, "fundchannel_start",
-			   fundchannel_start_done, tx_abort,
-			   fr, take(ret));
+	return send_outreq(cmd->plugin, req);
 }
 
-static struct command_result *tx_prepare_dryrun(struct command *cmd,
-					        const char *buf,
-						const jsmntok_t *result,
-						struct funding_req *fr)
+static struct command_result *post_dryrun(struct command *cmd,
+					  const char *buf,
+					  const jsmntok_t *result,
+					  struct funding_req *fr)
 {
 	struct bitcoin_tx *tx;
 	const char *hex;
@@ -349,7 +291,7 @@ static struct command_result *tx_prepare_dryrun(struct command *cmd,
 	/* Stash the 'reserved' txid to unreserve later */
 	hex = json_strdup(tmpctx, buf, json_get_member(buf, result, "txid"));
 	if (!bitcoin_txid_from_hex(hex, strlen(hex), &fr->tx_id))
-		plugin_err("Unable to parse reserved txid %s", hex);
+		plugin_err(cmd->plugin, "Unable to parse reserved txid %s", hex);
 
 
 	hex = json_strdup(tmpctx, buf, json_get_member(buf, result, "unsigned_tx"));
@@ -375,14 +317,58 @@ static struct command_result *tx_prepare_dryrun(struct command *cmd,
 	}
 
 	if (!funding_found)
-		plugin_err("Error creating placebo funding tx, funding_out not found. %s", hex);
+		plugin_err(cmd->plugin, "Error creating placebo funding tx, funding_out not found. %s", hex);
 
 	/* Update funding to actual amount */
-	if (fr->funding_all && amount_sat_greater(funding, chainparams->max_funding))
+	if (fr->funding_all
+	    && !feature_negotiated(plugin_feature_set(cmd->plugin),
+				   fr->their_features, OPT_LARGE_CHANNELS)
+	    && amount_sat_greater(funding, chainparams->max_funding))
 		funding = chainparams->max_funding;
 
 	fr->funding_str = type_to_string(fr, struct amount_sat, &funding);
 	return fundchannel_start(cmd, fr);
+}
+
+static struct command_result *exec_dryrun(struct command *cmd,
+					  const char *buf,
+					  const jsmntok_t *result,
+					  struct funding_req *fr)
+{
+	struct out_req *req;
+	const jsmntok_t *t;
+
+	/* Stash features so we can wumbo. */
+	t = json_get_member(buf, result, "features");
+	if (!t)
+		plugin_err(cmd->plugin, "No features found in connect response?");
+	fr->their_features = json_tok_bin_from_hex(fr, buf, t);
+	if (!fr->their_features)
+		plugin_err(cmd->plugin, "Bad features '%.*s' in connect response?",
+			   t->end - t->start, buf + t->start);
+
+	req = jsonrpc_request_start(cmd->plugin, cmd, "txprepare",
+				    post_dryrun, forward_error,
+				    fr);
+
+	/* Now that we've tried connecting, we do a 'dry-run' of txprepare,
+	 * so we can get an accurate idea of the funding amount */
+	txprepare(req->js, fr, placeholder_funding_addr);
+
+	return send_outreq(cmd->plugin, req);
+
+}
+
+static struct command_result *connect_to_peer(struct command *cmd,
+                                              struct funding_req *fr)
+{
+	struct out_req *req = jsonrpc_request_start(cmd->plugin, cmd, "connect",
+						    exec_dryrun, forward_error,
+						    fr);
+
+	json_add_string(req->js, "id", node_id_to_hexstr(tmpctx, fr->id));
+
+	return send_outreq(cmd->plugin, req);
 }
 
 /* We will use 'id' and 'amount' to build a output: {id: amount}.
@@ -411,67 +397,36 @@ static struct command_result *json_fundchannel(struct command *cmd,
 					       const jsmntok_t *params)
 {
 	struct funding_req *fr = tal(cmd, struct funding_req);
-	struct json_out *ret;
 
-	/* For generating help, give new-style. */
-	if (!params || !deprecated_apis || params->type == JSMN_ARRAY) {
-		if (!param(cmd, buf, params,
-			   p_req("id", param_node_id, &fr->id),
-			   p_req("amount", param_string_check_sat, &fr->funding_str),
-			   p_opt("feerate", param_string, &fr->feerate_str),
-			   p_opt_def("announce", param_bool, &fr->announce_channel, true),
-			   p_opt_def("minconf", param_number, &fr->minconf, 1),
-			   p_opt("utxos", param_string, &fr->utxo_str),
-			   NULL))
-			return command_param_failed();
-	} else {
-		const char *satoshi_str;
-		if (!param(cmd, buf, params,
-			   p_req("id", param_node_id, &fr->id),
-			   p_opt("amount", param_string, &fr->funding_str),
-			   p_opt("satoshi", param_string, &satoshi_str),
-			   p_opt("feerate", param_string, &fr->feerate_str),
-			   p_opt_def("announce", param_bool, &fr->announce_channel, true),
-			   p_opt_def("minconf", param_number, &fr->minconf, 1),
-			   p_opt("utxos", param_string, &fr->utxo_str),
-			   NULL))
-			return command_param_failed();
-
-		if (!fr->funding_str) {
-			if (satoshi_str)
-				fr->funding_str = satoshi_str;
-			else
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "Need set 'amount' field");
-		}
-	}
+	if (!param(cmd, buf, params,
+		   p_req("id", param_node_id, &fr->id),
+		   p_req("amount", param_string_check_sat, &fr->funding_str),
+		   p_opt("feerate", param_string, &fr->feerate_str),
+		   p_opt_def("announce", param_bool, &fr->announce_channel, true),
+		   p_opt_def("minconf", param_number, &fr->minconf, 1),
+		   p_opt("utxos", param_string, &fr->utxo_str),
+		   p_opt("push_msat", param_msat, &fr->push_msat),
+		   NULL))
+		return command_param_failed();
 
 	fr->funding_all = streq(fr->funding_str, "all");
 
-	/* First we do a 'dry-run' of txprepare, so we can get
-	 * an accurate idea of the funding amount */
-	ret = txprepare(cmd, fr, placeholder_funding_addr);
-
-	return send_outreq(cmd, "txprepare",
-			   tx_prepare_dryrun, forward_error,
-			   fr, take(ret));
-
+	return connect_to_peer(cmd, fr);
 }
 
-static void init(struct plugin_conn *rpc,
+static void init(struct plugin *p,
 		 const char *buf UNUSED, const jsmntok_t *config UNUSED)
 {
 	/* Figure out what the 'placeholder' addr is */
 	const char *network_name;
 	u8 *placeholder = tal_hexdata(tmpctx, placeholder_script, strlen(placeholder_script));
 
-	network_name = rpc_delve(tmpctx, "listconfigs",
+	network_name = rpc_delve(tmpctx, p, "listconfigs",
 				 take(json_out_obj(NULL, "config",
 						   "network")),
-			         rpc, ".network");
+				 ".network");
 	chainparams = chainparams_for_network(network_name);
-	placeholder_funding_addr = encode_scriptpubkey_to_addr(NULL,
-							       chainparams->bip173_name,
+	placeholder_funding_addr = encode_scriptpubkey_to_addr(NULL, chainparams,
 							       placeholder);
 }
 
@@ -479,7 +434,7 @@ static void init(struct plugin_conn *rpc,
 static const struct plugin_command commands[] = { {
 		"fundchannel",
 		"channels",
-		"Fund channel with {id} using {satoshi} (or 'all'), at optional {feerate}. "
+		"Fund channel with {id} using {amount} (or 'all'), at optional {feerate}. "
 		"Only use outputs that have {minconf} confirmations.",
 		"Initiaties a channel open with node 'id'. Must "
 		"be connected to the node and have enough funds available at the requested minimum confirmation "
@@ -492,5 +447,6 @@ static const struct plugin_command commands[] = { {
 int main(int argc, char *argv[])
 {
 	setup_locale();
-	plugin_main(argv, init, PLUGIN_RESTARTABLE, commands, ARRAY_SIZE(commands), NULL);
+	plugin_main(argv, init, PLUGIN_RESTARTABLE, true, NULL, commands,
+		    ARRAY_SIZE(commands), NULL, 0, NULL, 0, NULL);
 }

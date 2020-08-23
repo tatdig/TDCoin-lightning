@@ -1,6 +1,7 @@
 #include <bitcoin/address.h>
 #include <bitcoin/base58.h>
 #include <bitcoin/chainparams.h>
+#include <bitcoin/privkey.h>
 #include <bitcoin/script.h>
 #include <ccan/err/err.h>
 #include <ccan/opt/opt.h>
@@ -92,7 +93,7 @@ int main(int argc, char *argv[])
 		errx(ERROR_USAGE, "Need argument\n%s",
 		     opt_usage(argv[0], NULL));
 
-	b11 = bolt11_decode(ctx, argv[2], description, &fail);
+	b11 = bolt11_decode(ctx, argv[2], NULL, description, &fail);
 	if (!b11)
 		errx(ERROR_BAD_DECODE, "%s", fail);
 
@@ -117,6 +118,10 @@ int main(int argc, char *argv[])
 		printf("description_hash: %s\n",
 		       tal_hexstr(ctx, b11->description_hash,
 				  sizeof(*b11->description_hash)));
+	if (b11->payment_secret)
+		printf("payment_secret: %s\n",
+		       tal_hexstr(ctx, b11->payment_secret,
+				  sizeof(*b11->payment_secret)));
 	if (tal_bytelen(b11->features)) {
 		printf("features:");
 		for (size_t i = 0; i < tal_bytelen(b11->features) * CHAR_BIT; i++) {

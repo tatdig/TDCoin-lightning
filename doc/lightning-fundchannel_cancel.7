@@ -7,14 +7,17 @@ lightning-fundchannel_cancel - Command for completing channel establishment
 
 .SH DESCRIPTION
 
-\fBfundchannel_cancel\fR is a lower level RPC command\. It allows channel funder
+\fBfundchannel_cancel\fR is a lower level RPC command\. It allows channel opener
 to cancel a channel before funding broadcast with a connected peer\.
 
+
 \fIid\fR is the node id of the remote peer with which to cancel\.
+
 
 Note that the funding transaction MUST NOT be broadcast before
 \fBfundchannel_cancel\fR\. Broadcasting transaction before \fBfundchannel_cancel\fR
 WILL lead to unrecoverable loss of funds\.
+
 
 If \fBfundchannel_cancel\fR is called after \fBfundchannel_complete\fR, the remote
 peer may disconnect when command succeeds\. In this case, user need to connect
@@ -26,8 +29,22 @@ On success, returns confirmation that the channel establishment has been
 canceled\.
 
 
-On failure, returns an error\.
+On error the returned object will contain \fBcode\fR and \fBmessage\fR properties,
+with \fBcode\fR being one of the following:
 
+.RS
+.IP \[bu]
+-32602: If the given parameters are wrong\.
+.IP \[bu]
+306: Unknown peer id\.
+.IP \[bu]
+307: No channel currently being funded that can be cancelled\.
+.IP \[bu]
+308: It is unsafe to cancel the channel: the funding transaction
+has been broadcast, or there are HTLCs already in the channel, or
+the peer was the initiator and not us\.
+
+.RE
 .SH AUTHOR
 
 Lisa Neigut \fI<niftynei@gmail.com\fR> is mainly responsible\.

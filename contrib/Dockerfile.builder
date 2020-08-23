@@ -2,7 +2,7 @@ FROM ubuntu:16.04
 MAINTAINER Christian Decker <decker.christian@gmail.com>
 
 ENV DEBIAN_FRONTEND noninteractive
-ENV BITCOIN_VERSION 0.17.0
+ENV BITCOIN_VERSION 0.18.1
 
 WORKDIR /build
 
@@ -24,7 +24,6 @@ RUN apt-get -qq update && \
 	libsqlite3-dev \
 	libgmp-dev \
 	git \
-	python \
 	python3 \
 	valgrind \
 	net-tools \
@@ -55,7 +54,7 @@ RUN pip3 install --upgrade pip && \
     python3 -m pip install \
 	CherryPy==17.3.0 \
 	Flask==1.0.2 \
-	cheroot==6.5.2 \
+	cheroot==8.2.1 \
 	ephemeral-port-reserve==1.1.0 \
 	flaky==3.4.0 \
 	pytest-benchmark==3.1.1 \
@@ -63,8 +62,9 @@ RUN pip3 install --upgrade pip && \
 	pytest-timeout==1.3.3 \
 	pytest-xdist==1.22.2 \
 	pytest==3.8.1 \
-	python-bitcoinlib==0.7.0 \
+	python-bitcoinlib==0.10.2 \
 	tqdm==4.26.0 \
 	pytest-test-groups==1.0.3 \
 	flake8==3.5.0 \
-	pytest-rerunfailures==3.1
+	pytest-rerunfailures==3.1 \
+	mrkd==0.1.6
